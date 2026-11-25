@@ -36592,13 +36592,356 @@ globalThis.pdfjsLib = {
   XfaLayer
 };
 
+// shared/config.js
+var CURATED_MODELS = [
+  {
+    id: "deeprelay/deepseek-v4.1-flash",
+    label: "DeepSeek V4.1 Flash 1017",
+    vision: true,
+    useJsonObjectFirst: false,
+    supportsTemperature: true
+  },
+  {
+    id: "deeprelay/kimi-k3.1-pro",
+    label: "Kimi K3.1 Pro",
+    vision: true,
+    useJsonObjectFirst: true,
+    supportsTemperature: false
+  },
+  {
+    id: "deeprelay/glm-5.3",
+    label: "GLM 5.3",
+    vision: false,
+    useJsonObjectFirst: false,
+    supportsTemperature: true
+  },
+  {
+    id: "deeprelay/glm-5.3-flash",
+    label: "GLM 5.3 Flash",
+    vision: true,
+    useJsonObjectFirst: false,
+    supportsTemperature: true
+  }
+];
+var MODEL_IDS = CURATED_MODELS.map((model) => model.id);
+var LEGACY_DEFAULT_ANSWER_INSTRUCTIONS = "Answer exactly what the question asks. Be direct and concise. For multiple choice, choose only from the provided options. If the evidence is insufficient, say so briefly instead of guessing. Avoid unrelated details.";
+var PREVIOUS_DEFAULT_ANSWER_INSTRUCTIONS = `${LEGACY_DEFAULT_ANSWER_INSTRUCTIONS} When asked to write, fix, or complete code, provide the complete usable code solution rather than a partial snippet.`;
+var PREVIOUS_CODE_ONLY_ANSWER_INSTRUCTIONS = `${PREVIOUS_DEFAULT_ANSWER_INSTRUCTIONS} For code responses, provide the complete code only, without prose or Markdown fences. If an explanation is needed, write it as a comment using that language's syntax (for example, # comment in Python).`;
+var DEFAULT_ANSWER_INSTRUCTIONS = `${PREVIOUS_CODE_ONLY_ANSWER_INSTRUCTIONS} Add brief, useful comments for important or non-obvious logic so I can understand the code. Use the language's comment syntax, and do not comment every obvious line.`;
+var STUDY_LIMITS = {
+  MAX_STUDY_FILES: 25,
+  MAX_FILE_BYTES: 50 * 1024 * 1024,
+  MAX_EXTRACTED_CHARS: 5e5,
+  MAX_ARCHIVE_BYTES: 100 * 1024 * 1024,
+  MAX_ARCHIVE_ENTRIES: 2500,
+  MAX_PDF_PAGES: 1e3,
+  SUPPORTED_EXTENSIONS: ["pdf", "docx", "pptx", "txt", "md", "markdown", "html", "htm", "csv", "tsv", "json"]
+};
+var DEFAULT_SETTINGS = {
+  apiKey: "",
+  model: CURATED_MODELS[0].id,
+  customModelId: "",
+  useCustomModel: false,
+  reasoningEffort: "medium",
+  answerInstructions: DEFAULT_ANSWER_INSTRUCTIONS,
+  answerFontScale: 0.6,
+  answerUsePageColor: true,
+  answerCustomColor: "#333333",
+  groundingMode: "strict",
+  activeSetId: "",
+  activePopupTab: ""
+};
+
+// shared/text-module.js
+function chunkText(text, location, maxLength = 1600, overlap = 180) {
+  const normalized = String(text || "").replace(/\u0000/g, "").trim();
+  if (!normalized) return [];
+  if (normalized.length <= maxLength) {
+    return [{ location, text: normalized }];
+  }
+  const chunks = [];
+  const safeOverlap = Math.max(0, Math.min(overlap, Math.floor(maxLength * 0.35)));
+  let start = 0;
+  while (start < normalized.length) {
+    let end = Math.min(start + maxLength, normalized.length);
+    if (end < normalized.length) {
+      let boundary = normalized.lastIndexOf("\n", end);
+      if (boundary <= start + maxLength * 0.55) {
+        boundary = normalized.lastIndexOf(". ", end);
+        if (boundary > start + maxLength * 0.55) boundary += 1;
+      }
+      if (boundary <= start + maxLength * 0.55) {
+        boundary = normalized.lastIndexOf(" ", end);
+      }
+      if (boundary > start + maxLength * 0.55) end = boundary;
+    }
+    const piece = normalized.slice(start, end).trim();
+    if (piece) {
+      chunks.push({
+        location: chunks.length ? `${location} (continued)` : location,
+        text: piece
+      });
+    }
+    if (end >= normalized.length) break;
+    let nextStart = Math.max(start + 1, end - safeOverlap);
+    if (safeOverlap > 0 && nextStart > start + 1) {
+      const spaceAfter = normalized.indexOf(" ", nextStart);
+      if (spaceAfter !== -1 && spaceAfter < end - 20) {
+        nextStart = spaceAfter + 1;
+      }
+    }
+    start = nextStart;
+  }
+  return chunks;
+}
+function capSections(sections, maxChars = STUDY_LIMITS.MAX_EXTRACTED_CHARS) {
+  const result = [];
+  let remaining = maxChars;
+  let charCount = 0;
+  let truncated = false;
+  for (const section of sections || []) {
+    const raw = String(section?.text || "").trim();
+    if (!raw) continue;
+    if (remaining <= 0) {
+      truncated = true;
+      break;
+    }
+    if (raw.length > remaining) truncated = true;
+    const text = raw.slice(0, remaining).trim();
+    if (text) {
+      result.push({
+        location: String(section.location || "Document").slice(0, 160),
+        text
+      });
+      remaining -= text.length;
+      charCount += text.length;
+    }
+  }
+  return { sections: result, charCount, truncated };
+}
+async function computeContentHash(text) {
+  const input = String(text || "");
+  if (globalThis.crypto?.subtle?.digest) {
+    try {
+      const encoded = new TextEncoder().encode(input);
+      const digest = await globalThis.crypto.subtle.digest("SHA-256", encoded);
+      return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    } catch {
+    }
+  }
+  let h1 = 2166136261;
+  let h2 = 16777619;
+  for (let index = 0; index < input.length; index += 1) {
+    const code = input.charCodeAt(index);
+    h1 ^= code;
+    h1 = Math.imul(h1, 16777619);
+    h2 ^= code + (index & 255);
+    h2 = Math.imul(h2, 16777619);
+  }
+  return `fnv-${(h1 >>> 0).toString(16).padStart(8, "0")}${(h2 >>> 0).toString(16).padStart(8, "0")}`;
+}
+function extractMarkdownSections(text, defaultHeading = "Markdown") {
+  const sections = [];
+  let heading = defaultHeading;
+  let body = [];
+  const flush = () => {
+    const value = body.join("\n").trim();
+    if (value) sections.push(...chunkText(value, heading));
+    body = [];
+  };
+  for (const line of String(text || "").split(/\r?\n/)) {
+    const match = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/);
+    if (match) {
+      flush();
+      heading = match[1].slice(0, 120);
+    } else {
+      body.push(line);
+    }
+  }
+  flush();
+  return sections;
+}
+function extractHtmlSections(htmlText, defaultHeading = "Webpage") {
+  let cleaned = String(htmlText || "").replace(/<!--[\s\S]*?-->/g, " ").replace(/<(script|style|noscript|template|svg)\b[^>]*>[\s\S]*?<\/\1>/gi, " ");
+  const titleMatch = cleaned.match(/<title\b[^>]*>([\s\S]*?)<\/title>/i);
+  const docHeading = titleMatch ? decodeHtmlEntities(stripHtmlTags(titleMatch[1])).trim().slice(0, 120) : "";
+  cleaned = cleaned.replace(/<\/t[dh]>\s*<t[dh]\b[^>]*>/gi, " | ").replace(/<\/tr>/gi, "\n").replace(/<br\s*\/?>/gi, "\n").replace(/<li\b[^>]*>/gi, "\n\u2022 ").replace(/<\/(p|div|section|article|li|blockquote|pre|figcaption|header|footer|aside|dd|dt)>/gi, "\n");
+  const headingRegex = /<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>/gi;
+  const sections = [];
+  let currentHeading = docHeading || defaultHeading;
+  let lastIndex = 0;
+  const pushSlice = (rawSlice, location) => {
+    const plain = decodeHtmlEntities(stripHtmlTags(rawSlice)).replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").replace(/[ \t]{2,}/g, " ").trim();
+    if (plain) sections.push(...chunkText(plain, location));
+  };
+  for (const match of cleaned.matchAll(headingRegex)) {
+    const matchIndex = match.index ?? 0;
+    if (matchIndex > lastIndex) {
+      pushSlice(cleaned.slice(lastIndex, matchIndex), currentHeading);
+    }
+    const nextHeading = decodeHtmlEntities(stripHtmlTags(match[2])).replace(/\s+/g, " ").trim().slice(0, 120);
+    if (nextHeading) currentHeading = nextHeading;
+    lastIndex = matchIndex + match[0].length;
+  }
+  if (lastIndex < cleaned.length) {
+    pushSlice(cleaned.slice(lastIndex), currentHeading);
+  }
+  return sections;
+}
+function extractDelimitedSections(text, delimiter = ",") {
+  const rows = parseDelimitedRows(String(text || ""), delimiter);
+  if (!rows.length) return [];
+  const headers = rows[0].map((cell, index) => cell.trim() || `Column ${index + 1}`);
+  const dataRows = rows.length > 1 ? rows.slice(1) : rows;
+  const useHeaders = rows.length > 1;
+  const formattedLines = [];
+  let rowNumbers = [];
+  for (let index = 0; index < dataRows.length; index += 1) {
+    const row = dataRows[index];
+    if (!row.some((cell) => cell.trim())) continue;
+    const rowNumber = useHeaders ? index + 2 : index + 1;
+    const line = useHeaders ? row.map((cell, col) => `${headers[col] || `Column ${col + 1}`}: ${cell.trim()}`).filter((entry) => !entry.endsWith(": ")).join(" | ") : row.map((cell) => cell.trim()).filter(Boolean).join(" | ");
+    if (line) {
+      formattedLines.push(line);
+      rowNumbers.push(rowNumber);
+    }
+  }
+  if (!formattedLines.length) return [];
+  const sections = [];
+  let batch = [];
+  let batchNums = [];
+  let batchChars = 0;
+  const flush = () => {
+    if (!batch.length) return;
+    const first = batchNums[0];
+    const last = batchNums[batchNums.length - 1];
+    const location = first === last ? `Row ${first}` : `Rows ${first}\u2013${last}`;
+    sections.push(...chunkText(batch.join("\n"), location));
+    batch = [];
+    batchNums = [];
+    batchChars = 0;
+  };
+  for (let i2 = 0; i2 < formattedLines.length; i2 += 1) {
+    const line = formattedLines[i2];
+    if (batch.length && batchChars + line.length + 1 > 1400) flush();
+    batch.push(line);
+    batchNums.push(rowNumbers[i2]);
+    batchChars += line.length + 1;
+  }
+  flush();
+  return sections;
+}
+function extractJsonSections(text) {
+  let parsed;
+  try {
+    parsed = JSON.parse(String(text || ""));
+  } catch (error) {
+    throw new Error(`Could not read JSON file: ${error.message}`);
+  }
+  const sections = [];
+  if (Array.isArray(parsed)) {
+    for (let i2 = 0; i2 < parsed.length; i2 += 10) {
+      const slice = parsed.slice(i2, i2 + 10);
+      const location = slice.length === 1 ? `Item ${i2 + 1}` : `Items ${i2 + 1}\u2013${i2 + slice.length}`;
+      const body = slice.map((item, offset) => `[${i2 + offset + 1}] ${formatJsonValue(item)}`).join("\n");
+      sections.push(...chunkText(body, location));
+    }
+  } else if (parsed && typeof parsed === "object") {
+    for (const [key, value] of Object.entries(parsed)) {
+      const formatted = formatJsonValue(value);
+      if (formatted) sections.push(...chunkText(`${key}: ${formatted}`, key.slice(0, 120)));
+    }
+  } else if (parsed !== null && parsed !== void 0) {
+    sections.push(...chunkText(String(parsed), "JSON"));
+  }
+  return sections;
+}
+function stripHtmlTags(html) {
+  return String(html || "").replace(/<[^>]+>/g, " ");
+}
+function decodeHtmlEntities(text) {
+  const named = {
+    amp: "&",
+    lt: "<",
+    gt: ">",
+    quot: '"',
+    apos: "'",
+    nbsp: " ",
+    ndash: "\u2013",
+    mdash: "\u2014"
+  };
+  return String(text || "").replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (full, entity) => {
+    const lower = entity.toLowerCase();
+    if (Object.hasOwn(named, lower)) return named[lower];
+    if (lower.startsWith("#x")) {
+      const code = Number.parseInt(lower.slice(2), 16);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : full;
+    }
+    if (lower.startsWith("#")) {
+      const code = Number.parseInt(lower.slice(1), 10);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : full;
+    }
+    return full;
+  });
+}
+function parseDelimitedRows(input, delimiter) {
+  const rows = [];
+  let row = [];
+  let field = "";
+  let inQuotes = false;
+  for (let i2 = 0; i2 < input.length; i2 += 1) {
+    const ch = input[i2];
+    if (inQuotes) {
+      if (ch === '"' && input[i2 + 1] === '"') {
+        field += '"';
+        i2 += 1;
+      } else if (ch === '"') {
+        inQuotes = false;
+      } else {
+        field += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === delimiter) {
+      row.push(field);
+      field = "";
+    } else if (ch === "\r" || ch === "\n") {
+      if (ch === "\r" && input[i2 + 1] === "\n") i2 += 1;
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = "";
+    } else {
+      field += ch;
+    }
+  }
+  if (field.length > 0 || row.length > 0) {
+    row.push(field);
+    rows.push(row);
+  }
+  return rows;
+}
+function formatJsonValue(value, depth = 0) {
+  if (value === null || value === void 0) return "";
+  if (typeof value !== "object") return String(value);
+  if (depth >= 4) return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return value.map((item) => formatJsonValue(item, depth + 1)).filter(Boolean).join("; ");
+  }
+  return Object.entries(value).map(([key, val]) => {
+    const inner = formatJsonValue(val, depth + 1);
+    return inner ? `${key}: ${inner}` : "";
+  }).filter(Boolean).join(", ");
+}
+
 // src/file-parser.js
-var MAX_FILE_BYTES = 20 * 1024 * 1024;
-var MAX_FILE_COUNT = 10;
-var MAX_EXTRACTED_CHARS = 3e5;
-var MAX_ARCHIVE_BYTES = 35 * 1024 * 1024;
-var MAX_ARCHIVE_ENTRIES = 2e3;
-var MAX_PDF_PAGES = 500;
+var MAX_FILE_BYTES = STUDY_LIMITS.MAX_FILE_BYTES;
+var MAX_FILE_COUNT = STUDY_LIMITS.MAX_STUDY_FILES;
+var MAX_EXTRACTED_CHARS = STUDY_LIMITS.MAX_EXTRACTED_CHARS;
+var SUPPORTED_EXTENSIONS = STUDY_LIMITS.SUPPORTED_EXTENSIONS;
+var MAX_ARCHIVE_BYTES = STUDY_LIMITS.MAX_ARCHIVE_BYTES;
+var MAX_ARCHIVE_ENTRIES = STUDY_LIMITS.MAX_ARCHIVE_ENTRIES;
+var MAX_PDF_PAGES = STUDY_LIMITS.MAX_PDF_PAGES;
 GlobalWorkerOptions.workerSrc = chrome.runtime.getURL("vendor/pdf.worker.min.mjs");
 var xmlParser = new XMLParser({
   ignoreAttributes: false,
@@ -36607,29 +36950,119 @@ var xmlParser = new XMLParser({
   parseTagValue: false,
   trimValues: true
 });
-async function extractStudyFile(file) {
+var orderedXmlParser = new XMLParser({
+  preserveOrder: true,
+  ignoreAttributes: false,
+  attributeNamePrefix: "@_",
+  textNodeName: "#text",
+  parseTagValue: false,
+  trimValues: true
+});
+async function extractStudyFile(file, options = {}) {
+  const { onProgress, setId = "" } = options;
   const name = String(file?.name || "");
   const extension = name.split(".").pop()?.toLowerCase();
-  if (!name || !["pdf", "docx", "pptx", "txt", "md", "markdown"].includes(extension)) {
+  if (!name || !SUPPORTED_EXTENSIONS.includes(extension)) {
     throw new Error(`${name || "This file"} has an unsupported type.`);
   }
   if (!file.size || file.size > MAX_FILE_BYTES) {
-    throw new Error(`${name} must be between 1 byte and 20 MB.`);
+    throw new Error(`${name} must be between 1 byte and 50 MB.`);
   }
   const bytes = new Uint8Array(await file.arrayBuffer());
-  const sections = extension === "pdf" ? await extractPdf(bytes) : extension === "docx" ? extractDocx(bytes) : extension === "pptx" ? extractPptx(bytes) : extractTextFile(bytes, extension);
-  const normalized = capSections(sections);
-  if (!normalized.length) throw new Error(`No readable text was found in ${name}.`);
+  const warnings = [];
+  let rawSections = [];
+  if (extension === "pdf") {
+    const pdfResult = await extractPdf(bytes, name, onProgress);
+    rawSections = pdfResult.sections;
+    warnings.push(...pdfResult.warnings);
+  } else if (extension === "docx") {
+    rawSections = extractDocx(bytes);
+  } else if (extension === "pptx") {
+    rawSections = extractPptx(bytes, onProgress);
+  } else if (extension === "html" || extension === "htm") {
+    rawSections = extractHtmlSections(decodeText(bytes), name);
+  } else if (extension === "csv" || extension === "tsv") {
+    rawSections = extractDelimitedSections(decodeText(bytes), extension === "tsv" ? "	" : ",");
+  } else if (extension === "json") {
+    rawSections = extractJsonSections(decodeText(bytes));
+  } else if (extension === "md" || extension === "markdown") {
+    rawSections = extractMarkdownSections(decodeText(bytes));
+  } else {
+    rawSections = chunkText(decodeText(bytes), "Text");
+  }
+  const { sections, charCount, truncated } = capSections(rawSections);
+  if (!sections.length) throw new Error(`No readable text was found in ${name}.`);
+  if (truncated) {
+    warnings.push(`Truncated to ${MAX_EXTRACTED_CHARS.toLocaleString()} extracted characters.`);
+  }
+  const combinedText = sections.map((section) => `${section.location}
+${section.text}`).join("\n\n");
+  const contentHash = await computeContentHash(combinedText);
   return {
     id: crypto.randomUUID(),
     name,
     extension,
     size: file.size,
     addedAt: Date.now(),
-    sections: normalized
+    enabled: true,
+    setId: String(setId || ""),
+    sourceType: "file",
+    sourceUrl: "",
+    contentHash,
+    charCount,
+    truncated,
+    warnings,
+    sections
   };
 }
-async function extractPdf(bytes) {
+async function extractStudyArchive(file, options = {}) {
+  const name = String(file?.name || "archive.zip");
+  if (!file.size || file.size > MAX_FILE_BYTES) {
+    throw new Error(`${name} must be between 1 byte and 50 MB.`);
+  }
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const entries = unzipChecked(bytes);
+  const extracted = [];
+  const skipped = [];
+  const errors = [];
+  const paths = Object.keys(entries).sort((left, right) => left.localeCompare(right));
+  for (let index = 0; index < paths.length; index += 1) {
+    const entryPath = paths[index];
+    const entryBytes = entries[entryPath];
+    if (!entryBytes || entryPath.endsWith("/")) continue;
+    const segments = entryPath.split("/").filter(Boolean);
+    const baseName = segments[segments.length - 1] || "";
+    if (!baseName || baseName.startsWith(".") || segments.includes("__MACOSX")) continue;
+    const ext = baseName.split(".").pop()?.toLowerCase();
+    if (!SUPPORTED_EXTENSIONS.includes(ext)) {
+      skipped.push({ name: entryPath, reason: `Unsupported type (.${ext || "unknown"})` });
+      continue;
+    }
+    if (!entryBytes.byteLength) {
+      skipped.push({ name: entryPath, reason: "Empty file" });
+      continue;
+    }
+    options.onProgress?.({
+      phase: "zip",
+      current: index + 1,
+      total: paths.length,
+      detail: `Extracting ${baseName} from ${name}`
+    });
+    const virtualFile = {
+      name: entryPath,
+      size: entryBytes.byteLength,
+      arrayBuffer: async () => entryBytes.buffer.slice(entryBytes.byteOffset, entryBytes.byteOffset + entryBytes.byteLength)
+    };
+    try {
+      const module = await extractStudyFile(virtualFile, options);
+      extracted.push(module);
+    } catch (error) {
+      errors.push({ name: entryPath, error: error instanceof Error ? error.message : "Could not read archive entry." });
+    }
+  }
+  return { extracted, skipped, errors };
+}
+async function extractPdf(bytes, name, onProgress) {
   let document2;
   try {
     document2 = await getDocument({
@@ -36646,14 +37079,35 @@ async function extractPdf(bytes) {
       throw new Error(`PDF has more than ${MAX_PDF_PAGES} pages.`);
     }
     const sections = [];
+    let totalChars = 0;
+    let emptyPageCount = 0;
     for (let pageNumber = 1; pageNumber <= document2.numPages; pageNumber += 1) {
+      onProgress?.({
+        phase: "pdf",
+        current: pageNumber,
+        total: document2.numPages,
+        detail: `Reading page ${pageNumber} of ${document2.numPages}`
+      });
       const page = await document2.getPage(pageNumber);
       const content = await page.getTextContent();
-      const text = content.items.map((item) => typeof item.str === "string" ? item.str : "").join(" ").replace(/\s+/g, " ").trim();
-      if (text) sections.push(...chunkText(text, `Page ${pageNumber}`));
-      if (sections.reduce((sum, section) => sum + section.text.length, 0) >= MAX_EXTRACTED_CHARS) break;
+      const text = reconstructPdfPageText(content.items || []);
+      const nonSpaceLength = text.replace(/\s+/g, "").length;
+      if (nonSpaceLength < 15) emptyPageCount += 1;
+      if (text) {
+        const chunks = chunkText(text, `Page ${pageNumber}`);
+        sections.push(...chunks);
+        totalChars += chunks.reduce((sum, chunk) => sum + chunk.text.length, 0);
+      }
+      if (totalChars >= MAX_EXTRACTED_CHARS) break;
     }
-    return sections;
+    if (!sections.length) {
+      throw new Error(`${name} appears to be a scanned or image-only PDF with no selectable text.`);
+    }
+    const warnings = [];
+    if (emptyPageCount > 0 && document2.numPages > 1) {
+      warnings.push(`${emptyPageCount} of ${document2.numPages} pages had no selectable text (may be scanned images).`);
+    }
+    return { sections, warnings };
   } finally {
     if (typeof document2?.destroy === "function") {
       try {
@@ -36663,63 +37117,204 @@ async function extractPdf(bytes) {
     }
   }
 }
+function reconstructPdfPageText(items) {
+  const lines = [];
+  let currentLine = "";
+  let prevY = null;
+  for (const item of items) {
+    const str = typeof item?.str === "string" ? item.str : "";
+    const y = Array.isArray(item?.transform) ? item.transform[5] : null;
+    if (prevY !== null && y !== null && Math.abs(y - prevY) > 4 && currentLine.trim()) {
+      lines.push(currentLine.trim());
+      currentLine = "";
+    }
+    if (str) {
+      if (currentLine && !currentLine.endsWith(" ") && !str.startsWith(" ") && !/^[,.;:!?)]/.test(str)) {
+        currentLine += " ";
+      }
+      currentLine += str;
+    }
+    if (item?.hasEOL) {
+      if (currentLine.trim()) lines.push(currentLine.trim());
+      currentLine = "";
+      prevY = null;
+    } else if (y !== null) {
+      prevY = y;
+    }
+  }
+  if (currentLine.trim()) lines.push(currentLine.trim());
+  return lines.join("\n").replace(/[ \t]{2,}/g, " ").trim();
+}
 function extractDocx(bytes) {
   const files = unzipChecked(bytes);
   const documentBytes = files["word/document.xml"];
   if (!documentBytes) throw new Error("DOCX archive is missing its document body.");
-  const xml = parseXml2(documentBytes, "DOCX document");
-  const paragraphs = findElements(xml, "p");
+  const orderedDoc = parseOrderedXml(documentBytes, "DOCX document");
+  const bodyNode = findOrderedElement(orderedDoc, "body");
+  const bodyChildren = bodyNode ? orderedChildren(bodyNode) : orderedDoc;
   const sections = [];
   let heading = "Document";
+  let pendingHeadingHeader = "";
   let paragraphNumber = 0;
-  for (const paragraph of paragraphs) {
-    const text = collectText(paragraph).replace(/\s+/g, " ").trim();
-    if (!text) continue;
-    paragraphNumber += 1;
-    const style = findAttributeInDescendants(paragraph, "pStyle", "val") || "";
-    if (/^heading\d+$/i.test(style)) heading = text.slice(0, 120);
-    else sections.push(...chunkText(text, `${heading} \xB7 paragraph ${paragraphNumber}`));
-    if (sections.reduce((sum, section) => sum + section.text.length, 0) >= MAX_EXTRACTED_CHARS) break;
+  let totalChars = 0;
+  let groupedParagraphs = [];
+  let groupStart = 0;
+  let groupEnd = 0;
+  let groupChars = 0;
+  const flushParagraphGroup = () => {
+    if (!groupedParagraphs.length) {
+      if (pendingHeadingHeader) {
+        sections.push(...chunkText(pendingHeadingHeader, heading));
+        pendingHeadingHeader = "";
+      }
+      return;
+    }
+    const location = groupStart === groupEnd ? `${heading} \xB7 paragraph ${groupStart}` : `${heading} \xB7 paragraphs ${groupStart}\u2013${groupEnd}`;
+    const bodyText = groupedParagraphs.join("\n");
+    const fullText = pendingHeadingHeader ? `${pendingHeadingHeader}
+${bodyText}` : bodyText;
+    const chunks = chunkText(fullText, location);
+    sections.push(...chunks);
+    totalChars += chunks.reduce((sum, chunk) => sum + chunk.text.length, 0);
+    groupedParagraphs = [];
+    pendingHeadingHeader = "";
+    groupStart = 0;
+    groupEnd = 0;
+    groupChars = 0;
+  };
+  for (const child of bodyChildren) {
+    const tag = orderedTagName(child);
+    if (tag === "p") {
+      const text = collectOrderedText(child).replace(/[ \t]+/g, " ").trim();
+      if (!text) continue;
+      paragraphNumber += 1;
+      const style = findOrderedAttribute(child, "pStyle", "val");
+      if (/^heading\d+$/i.test(style)) {
+        flushParagraphGroup();
+        heading = text.slice(0, 120);
+        pendingHeadingHeader = heading;
+      } else {
+        if (groupedParagraphs.length && groupChars + text.length + 1 > 1400) {
+          flushParagraphGroup();
+        }
+        if (!groupedParagraphs.length) groupStart = paragraphNumber;
+        groupEnd = paragraphNumber;
+        groupedParagraphs.push(text);
+        groupChars += text.length + 1;
+      }
+    } else if (tag === "tbl") {
+      flushParagraphGroup();
+      const tableText = extractOrderedDocxTable(child);
+      if (tableText) {
+        const chunks = chunkText(tableText, `${heading} \xB7 table`);
+        sections.push(...chunks);
+        totalChars += chunks.reduce((sum, chunk) => sum + chunk.text.length, 0);
+      }
+    }
+    if (totalChars >= MAX_EXTRACTED_CHARS) break;
+  }
+  flushParagraphGroup();
+  for (const [notePath, label] of [["word/footnotes.xml", "Footnotes"], ["word/endnotes.xml", "Endnotes"]]) {
+    if (!files[notePath] || totalChars >= MAX_EXTRACTED_CHARS) continue;
+    try {
+      const noteXml = parseXml2(files[notePath], label);
+      const notes = findElements(noteXml, "p").map((paragraph) => collectText(paragraph).replace(/[ \t]+/g, " ").trim()).filter(Boolean);
+      if (notes.length) {
+        const chunks = chunkText(notes.join("\n"), label);
+        sections.push(...chunks);
+        totalChars += chunks.reduce((sum, chunk) => sum + chunk.text.length, 0);
+      }
+    } catch {
+    }
   }
   return sections;
 }
-function extractPptx(bytes) {
+function extractOrderedDocxTable(tableNode) {
+  const rows = [];
+  for (const rowNode of findAllOrderedElements(tableNode, "tr")) {
+    const cells = [];
+    for (const cellNode of orderedChildren(rowNode)) {
+      if (orderedTagName(cellNode) !== "tc") continue;
+      const cellText = collectOrderedText(cellNode).replace(/\s+/g, " ").trim();
+      if (cellText) cells.push(cellText);
+    }
+    if (cells.length) rows.push(cells.join(" | "));
+  }
+  return rows.join("\n");
+}
+function extractPptx(bytes, onProgress) {
   const files = unzipChecked(bytes);
   const paths = Object.keys(files).filter((path) => /^ppt\/slides\/slide\d+\.xml$/i.test(path)).sort((a, b) => Number(a.match(/slide(\d+)/i)[1]) - Number(b.match(/slide(\d+)/i)[1]));
   if (!paths.length) throw new Error("PPTX archive has no slide text.");
   const sections = [];
-  for (const path of paths) {
+  let totalChars = 0;
+  for (let index = 0; index < paths.length; index += 1) {
+    const path = paths[index];
     const slideNumber = Number(path.match(/slide(\d+)/i)[1]);
+    onProgress?.({
+      phase: "pptx",
+      current: index + 1,
+      total: paths.length,
+      detail: `Reading slide ${index + 1} of ${paths.length}`
+    });
     const xml = parseXml2(files[path], `slide ${slideNumber}`);
-    const paragraphs = findElements(xml, "p");
-    const text = paragraphs.map((paragraph) => collectText(paragraph).replace(/\s+/g, " ").trim()).filter(Boolean).join("\n");
-    if (text) sections.push(...chunkText(text, `Slide ${slideNumber}`));
-    if (sections.reduce((sum, section) => sum + section.text.length, 0) >= MAX_EXTRACTED_CHARS) break;
+    const paragraphs = findElements(xml, "p").map((paragraph) => collectText(paragraph).replace(/\s+/g, " ").trim()).filter(Boolean);
+    const tables = findElements(xml, "tbl").map((tbl) => extractPptxTable(tbl)).filter(Boolean);
+    const slideParts = [];
+    if (paragraphs.length) slideParts.push(paragraphs.join("\n"));
+    if (tables.length) slideParts.push(tables.join("\n"));
+    const slideText = slideParts.join("\n").trim();
+    if (slideText) {
+      const chunks = chunkText(slideText, `Slide ${slideNumber}`);
+      sections.push(...chunks);
+      totalChars += chunks.reduce((sum, chunk) => sum + chunk.text.length, 0);
+    }
+    const notesPath = resolveSlideNotesPath(files, slideNumber);
+    if (notesPath && files[notesPath] && totalChars < MAX_EXTRACTED_CHARS) {
+      try {
+        const notesXml = parseXml2(files[notesPath], `slide ${slideNumber} notes`);
+        const noteLines = findElements(notesXml, "p").map((paragraph) => collectText(paragraph).replace(/\s+/g, " ").trim()).filter((line) => line && line !== String(slideNumber));
+        if (noteLines.length) {
+          const chunks = chunkText(noteLines.join("\n"), `Slide ${slideNumber} \xB7 Notes`);
+          sections.push(...chunks);
+          totalChars += chunks.reduce((sum, chunk) => sum + chunk.text.length, 0);
+        }
+      } catch {
+      }
+    }
+    if (totalChars >= MAX_EXTRACTED_CHARS) break;
   }
   return sections;
 }
-function extractTextFile(bytes, extension) {
-  const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes).replace(/^\uFEFF/, "");
-  if (extension !== "md" && extension !== "markdown") return chunkText(text, "Text");
-  const sections = [];
-  let heading = "Markdown";
-  let body = [];
-  const flush = () => {
-    const value = body.join("\n").trim();
-    if (value) sections.push(...chunkText(value, heading));
-    body = [];
-  };
-  for (const line of text.split(/\r?\n/)) {
-    const match = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/);
-    if (match) {
-      flush();
-      heading = match[1].slice(0, 120);
-    } else {
-      body.push(line);
+function extractPptxTable(tableNode) {
+  const rows = [];
+  for (const row of findElements(tableNode, "tr")) {
+    const cells = findElements(row, "tc").map((cell) => collectText(cell).replace(/\s+/g, " ").trim()).filter(Boolean);
+    if (cells.length) rows.push(cells.join(" | "));
+  }
+  return rows.join("\n");
+}
+function resolveSlideNotesPath(files, slideNumber) {
+  const relsPath = `ppt/slides/_rels/slide${slideNumber}.xml.rels`;
+  if (files[relsPath]) {
+    try {
+      const relsXml = parseXml2(files[relsPath], `slide ${slideNumber} relationships`);
+      for (const rel of findElements(relsXml, "Relationship")) {
+        const type = String(rel?.["@_Type"] || "");
+        const target = String(rel?.["@_Target"] || "");
+        if (/notesSlide/i.test(type) && target) {
+          const resolved = target.replace(/^\.\.\//, "ppt/").replace(/^\/+/, "");
+          if (files[resolved]) return resolved;
+        }
+      }
+    } catch {
     }
   }
-  flush();
-  return sections;
+  const fallback = `ppt/notesSlides/notesSlide${slideNumber}.xml`;
+  return files[fallback] ? fallback : "";
+}
+function decodeText(bytes) {
+  return new TextDecoder("utf-8", { fatal: false }).decode(bytes).replace(/^\uFEFF/, "");
 }
 function parseXml2(bytes, label) {
   try {
@@ -36729,6 +37324,66 @@ function parseXml2(bytes, label) {
   } catch (error) {
     throw new Error(`Could not read ${label}: ${error.message}`);
   }
+}
+function parseOrderedXml(bytes, label) {
+  try {
+    const xml = orderedXmlParser.parse(strFromU8(bytes));
+    if (!Array.isArray(xml)) throw new Error("empty XML");
+    return xml;
+  } catch (error) {
+    throw new Error(`Could not read ${label}: ${error.message}`);
+  }
+}
+function orderedTagName(node) {
+  if (!node || typeof node !== "object") return "";
+  for (const key of Object.keys(node)) {
+    if (key !== ":@" && key !== "#text") return key.split(":").at(-1);
+  }
+  return "";
+}
+function orderedChildren(node) {
+  if (!node || typeof node !== "object") return [];
+  for (const [key, value] of Object.entries(node)) {
+    if (key !== ":@" && key !== "#text" && Array.isArray(value)) return value;
+  }
+  return [];
+}
+function findOrderedElement(nodes, localName) {
+  for (const node of nodes || []) {
+    if (orderedTagName(node) === localName) return node;
+    const nested = findOrderedElement(orderedChildren(node), localName);
+    if (nested) return nested;
+  }
+  return null;
+}
+function findAllOrderedElements(root, localName) {
+  const results = [];
+  const visit = (nodes) => {
+    for (const node of nodes || []) {
+      if (orderedTagName(node) === localName) results.push(node);
+      visit(orderedChildren(node));
+    }
+  };
+  visit(Array.isArray(root) ? root : orderedChildren(root));
+  return results;
+}
+function collectOrderedText(node) {
+  const tag = orderedTagName(node);
+  if (tag === "tab") return "	";
+  if (tag === "br" || tag === "cr") return "\n";
+  if (typeof node?.["#text"] === "string" || typeof node?.["#text"] === "number") {
+    return String(node["#text"]);
+  }
+  return orderedChildren(node).map(collectOrderedText).join("");
+}
+function findOrderedAttribute(root, elementName, attributeName) {
+  for (const element of findAllOrderedElements(root, elementName)) {
+    const attrs = element?.[":@"] || {};
+    for (const [key, value] of Object.entries(attrs)) {
+      if (key === `@_w:${attributeName}` || key === `@_${attributeName}`) return String(value);
+    }
+  }
+  return "";
 }
 function findElements(root, localName) {
   const found = [];
@@ -36754,22 +37409,21 @@ function collectText(node) {
   if (typeof node === "string" || typeof node === "number") return String(node);
   if (Array.isArray(node)) return node.map(collectText).join("");
   if (!node || typeof node !== "object") return "";
-  return Object.entries(node).map(([key, value]) => key === "#text" ? String(value) : key.startsWith("@_") ? "" : collectText(value)).join("");
-}
-function findAttributeInDescendants(root, elementName, attributeName) {
-  for (const element of findElements(root, elementName)) {
-    for (const [key, value] of Object.entries(element || {})) {
-      if (key === `@_w:${attributeName}` || key === `@_${attributeName}`) return String(value);
-    }
-  }
-  return "";
+  return Object.entries(node).map(([key, value]) => {
+    if (key === "#text") return String(value);
+    if (key.startsWith("@_")) return "";
+    const local = key.split(":").at(-1);
+    if (local === "tab") return "	";
+    if (local === "br" || local === "cr") return "\n";
+    return collectText(value);
+  }).join("");
 }
 function unzipChecked(bytes) {
   checkZipDirectory(bytes);
   try {
     return unzipSync(bytes);
   } catch {
-    throw new Error("The office document is damaged or uses an unsupported compression format.");
+    throw new Error("The office or ZIP archive is damaged or uses an unsupported compression format.");
   }
 }
 function checkZipDirectory(bytes) {
@@ -36781,23 +37435,33 @@ function checkZipDirectory(bytes) {
       break;
     }
   }
-  if (endOffset < 0) throw new Error("The office file is not a valid ZIP document.");
+  if (endOffset < 0) throw new Error("The archive is not a valid ZIP document.");
   const entries = read16(bytes, endOffset + 10);
   const directoryOffset = read32(bytes, endOffset + 16);
-  if (entries > MAX_ARCHIVE_ENTRIES || directoryOffset >= bytes.length) throw new Error("Office archive exceeds safe extraction limits.");
+  if (entries > MAX_ARCHIVE_ENTRIES || directoryOffset >= bytes.length) {
+    throw new Error("Archive exceeds safe extraction limits.");
+  }
   let offset = directoryOffset;
   let totalUncompressed = 0;
   for (let index = 0; index < entries; index += 1) {
-    if (read32(bytes, offset) !== 33639248 || offset + 46 > bytes.length) throw new Error("The office document has a malformed ZIP directory.");
+    if (read32(bytes, offset) !== 33639248 || offset + 46 > bytes.length) {
+      throw new Error("The archive has a malformed ZIP directory.");
+    }
     const compressed = read32(bytes, offset + 20);
     const uncompressed = read32(bytes, offset + 24);
     const nameLength = read16(bytes, offset + 28);
     const extraLength = read16(bytes, offset + 30);
     const commentLength = read16(bytes, offset + 32);
-    if (compressed === 4294967295 || uncompressed === 4294967295) throw new Error("ZIP64 office documents are not supported.");
-    if (uncompressed > MAX_ARCHIVE_BYTES) throw new Error("An office document entry exceeds the safe extraction limit.");
+    if (compressed === 4294967295 || uncompressed === 4294967295) {
+      throw new Error("ZIP64 archives are not supported.");
+    }
+    if (uncompressed > MAX_ARCHIVE_BYTES) {
+      throw new Error("An archive entry exceeds the safe extraction limit.");
+    }
     totalUncompressed += uncompressed;
-    if (totalUncompressed > MAX_ARCHIVE_BYTES) throw new Error("Office document expands beyond the 35 MB extraction limit.");
+    if (totalUncompressed > MAX_ARCHIVE_BYTES) {
+      throw new Error("Archive expands beyond the 100 MB extraction limit.");
+    }
     offset += 46 + nameLength + extraLength + commentLength;
   }
 }
@@ -36808,37 +37472,11 @@ function read32(bytes, offset) {
   if (offset + 4 > bytes.length) return -1;
   return (bytes[offset] | bytes[offset + 1] << 8 | bytes[offset + 2] << 16 | bytes[offset + 3] << 24) >>> 0;
 }
-function chunkText(text, location, maxLength = 1600) {
-  const normalized = String(text || "").replace(/\u0000/g, "").trim();
-  if (!normalized) return [];
-  const chunks = [];
-  for (let start = 0; start < normalized.length; start += maxLength) {
-    let end = Math.min(start + maxLength, normalized.length);
-    if (end < normalized.length) {
-      const boundary = normalized.lastIndexOf(" ", end);
-      if (boundary > start + maxLength * 0.6) end = boundary;
-    }
-    chunks.push({ location: chunks.length ? `${location} (continued)` : location, text: normalized.slice(start, end).trim() });
-    start = end - maxLength;
-  }
-  return chunks;
-}
-function capSections(sections) {
-  const result = [];
-  let remaining = MAX_EXTRACTED_CHARS;
-  for (const section of sections) {
-    if (remaining <= 0) break;
-    const text = String(section?.text || "").trim().slice(0, remaining);
-    if (text) {
-      result.push({ location: String(section.location || "Document").slice(0, 160), text });
-      remaining -= text.length;
-    }
-  }
-  return result;
-}
 export {
   MAX_EXTRACTED_CHARS,
   MAX_FILE_BYTES,
   MAX_FILE_COUNT,
+  SUPPORTED_EXTENSIONS,
+  extractStudyArchive,
   extractStudyFile
 };

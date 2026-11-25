@@ -5,11 +5,13 @@
 
   const OPTION_ATTR = "data-answerly-option-id";
   const OUTPUT_ATTR = "data-answerly-output";
+  const SVG_NS = "http://www.w3.org/2000/svg";
   const MAX_OPTIONS = 40;
   let operationNumber = 0;
   let activeOperation = 0;
   let selectionCapturePending = false;
   let activeRequestId = "";
+  let activeCaptureId = "";
   let activeEditorStatusToken = "";
   let activeContentEditableStatus = null;
   let activeOptions = [];
@@ -17,7 +19,12 @@
   let answerUsePageColor = true;
   let answerCustomColor = "#333333";
   let imageCaptureArmed = false;
-  let imageClickHandler = null;
+  let previousDocumentCursor = "";
+  let cropBox = null;
+  let pointerDownHandler = null;
+  let pointerMoveHandler = null;
+  let pointerUpHandler = null;
+  let captureClickSuppressHandler = null;
   let imageKeyHandler = null;
 
   chrome.runtime.onMessage.addListener((message) => {
@@ -31,12 +38,12 @@
   });
 
   chrome.storage.local.get({ answerFontScale: 0.6, answerUsePageColor: true, answerCustomColor: "#333333" }).then((settings) => {
-    const savedScale = settings.answerFontScale;
-    const scale = Number(savedScale);
+    const scale = Number(settings.answerFontScale);
     if (Number.isFinite(scale)) answerFontScale = Math.max(0.4, Math.min(1, scale));
     answerUsePageColor = settings.answerUsePageColor !== false;
     if (isValidHexColor(settings.answerCustomColor)) answerCustomColor = settings.answerCustomColor;
   }).catch(() => {});
+
   chrome.storage.onChanged.addListener((changes, areaName) => {
     if (areaName !== "local") return;
     if (changes.answerFontScale) {
@@ -71,7 +78,7 @@
     const insertionPoint = editableSelection ? null : makeInsertionPoint(selection);
     const options = mode === "multiple-choice" ? findRadioOptions(anchor) : findNearbyContextOptions(anchor);
     if (mode === "multiple-choice" && options.length < 2) {
-      showPageMessage("No multiple-choice radio options were found near this question.", anchor);
+      showPageMessage("No multiple-choice options were found near this question.", anchor);
       return;
     }
 
@@ -80,8 +87,7 @@
     activeOperation = operationId;
     activeRequestId = requestId;
     activeOptions = options;
-    // Keep loading text outside an editable control so it never becomes part of the user's text.
-    const pending = insertPageText(anchor, "Thinking…", "", insertionPoint);
+    const pending = insertPendingNode(anchor, "Thinking…", "", insertionPoint);
     try {
       if (mode === "words" && editableSelection?.type === "page-editor") {
         activeEditorStatusToken = editableSelection.token;
@@ -113,11 +119,11 @@
 
       if (mode === "multiple-choice") {
         const choice = options.find((option) => option.id === result.correctOptionId);
-        if (result.correctOptionId !== null && !choice) throw new Error("The returned answer did not match a radio option on the page.");
-        await completeAnswer(pending, formatAnswer(result), editableSelection);
-      } else {
-        await completeAnswer(pending, formatAnswer(result), editableSelection);
+        if (result.correctOptionId !== null && !choice) {
+          throw new Error("The returned answer did not match an option on the page.");
+        }
       }
+      await completeAnswer(pending, formatAnswer(result), editableSelection);
     } catch (error) {
       if (editableSelection?.type === "page-editor" && activeEditorStatusToken === editableSelection.token) {
         await finishEditorStatus(editableSelection.token, "");
@@ -128,8 +134,7 @@
         activeContentEditableStatus = null;
       }
       if (activeOperation === operationId && error?.name !== "AbortError") {
-        pending.textContent = `Answerly: ${error.message || "Something went wrong."} (click to dismiss)`;
-        pending.setAttribute("aria-live", "polite");
+        setStatusBannerText(pending, `Answerly: ${error.message || "Something went wrong."} (click to dismiss)`);
       } else {
         pending.remove();
       }
@@ -150,16 +155,18 @@
   function clearOutput() {
     operationNumber += 1;
     const requestId = activeRequestId;
+    const captureId = activeCaptureId;
     const statusToken = activeEditorStatusToken;
     const contentEditableStatus = activeContentEditableStatus;
     activeOperation = 0;
     activeRequestId = "";
+    activeCaptureId = "";
     activeEditorStatusToken = "";
     activeContentEditableStatus = null;
     if (statusToken) finishEditorStatus(statusToken, "");
     if (contentEditableStatus) finishContentEditableStatus(contentEditableStatus, "");
-    if (requestId) {
-      chrome.runtime.sendMessage({ type: "ANSWERLY_CANCEL_REQUEST", requestId }).catch(() => {});
+    if (requestId || captureId) {
+      chrome.runtime.sendMessage({ type: "ANSWERLY_CANCEL_REQUEST", requestId, captureId }).catch(() => {});
     }
     restoreOptionAttributes(activeOptions);
     activeOptions = [];
@@ -170,75 +177,393 @@
   function armImageCapture() {
     if (activeOperation || imageCaptureArmed) return;
     imageCaptureArmed = true;
-    // Alt+R arms one click; the page itself remains interactive and no image is sent before that click.
-    imageClickHandler = (event) => {
-      if (event.target?.closest?.(`[${OUTPUT_ATTR}]`)) return;
-      disarmImageCapture();
-      const clicked = elementForNode(event.target);
-      if (!clicked) return;
-      const visual = clicked.closest("img,canvas,svg,[role='img'],picture") || clicked;
-      const rect = visual.getBoundingClientRect();
-      const pointRect = {
-        x: rect.width > 0 ? rect.left : event.clientX - 280,
-        y: rect.height > 0 ? rect.top : event.clientY - 180,
-        width: rect.width > 0 ? rect.width : 560,
-        height: rect.height > 0 ? rect.height : 360
+    previousDocumentCursor = document.documentElement.style.cursor;
+    document.documentElement.style.cursor = "crosshair";
+
+    let dragState = null;
+
+    pointerDownHandler = (event) => {
+      if (event.button !== 0 || event.target?.closest?.(`[${OUTPUT_ATTR}]`)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      dragState = {
+        startX: event.clientX,
+        startY: event.clientY,
+        currentX: event.clientX,
+        currentY: event.clientY,
+        target: event.target
       };
-      const viewport = { width: window.innerWidth, height: window.innerHeight };
-      const anchor = findQuestionBlock(visual);
-      const pending = insertPageText(anchor, "Reading image…", "Answerly");
+    };
+
+    pointerMoveHandler = (event) => {
+      if (!dragState) return;
+      dragState.currentX = event.clientX;
+      dragState.currentY = event.clientY;
+      const dx = Math.abs(dragState.currentX - dragState.startX);
+      const dy = Math.abs(dragState.currentY - dragState.startY);
+      if (dx < 8 && dy < 8) return;
+      if (!cropBox) {
+        cropBox = document.createElement("div");
+        cropBox.setAttribute(OUTPUT_ATTR, "crop");
+        cropBox.style.position = "fixed";
+        cropBox.style.pointerEvents = "none";
+        cropBox.style.zIndex = "2147483647";
+        cropBox.style.border = "1.5px dashed #0066cc";
+        cropBox.style.background = "rgba(0, 102, 204, 0.08)";
+        cropBox.style.borderRadius = "4px";
+        document.documentElement.append(cropBox);
+      }
+      const left = Math.min(dragState.startX, dragState.currentX);
+      const top = Math.min(dragState.startY, dragState.currentY);
+      cropBox.style.left = `${left}px`;
+      cropBox.style.top = `${top}px`;
+      cropBox.style.width = `${dx}px`;
+      cropBox.style.height = `${dy}px`;
+    };
+
+    pointerUpHandler = async (event) => {
+      if (!dragState) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const finished = dragState;
+      dragState = null;
+
+      const dx = Math.abs(event.clientX - finished.startX);
+      const dy = Math.abs(event.clientY - finished.startY);
+      const isDragCrop = dx >= 8 || dy >= 8;
+
+      if (cropBox) {
+        cropBox.remove();
+        cropBox = null;
+      }
+      disarmImageCapture();
+
+      // Wait two animation frames so the cursor and crop outline settle before captureVisibleTab.
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+
+      const clicked = elementForNode(finished.target);
+      if (!clicked) return;
+      const visual = resolveClickedVisual(clicked, finished.startX, finished.startY);
+      const viewport = {
+        width: document.documentElement.clientWidth || window.innerWidth,
+        height: document.documentElement.clientHeight || window.innerHeight
+      };
+
+      let pointRect;
+      let contextElement;
+      let anchor;
+      let standalone = isStandaloneImagePage();
+
+      if (isDragCrop) {
+        pointRect = {
+          x: Math.min(finished.startX, event.clientX),
+          y: Math.min(finished.startY, event.clientY),
+          width: Math.max(16, dx),
+          height: Math.max(16, dy)
+        };
+        contextElement = visual;
+        anchor = findQuestionBlock(visual);
+      } else {
+        const targetInfo = findCaptureTarget(clicked, visual, viewport);
+        pointRect = targetInfo.rect || {
+          x: Math.max(0, event.clientX - 280),
+          y: Math.max(0, event.clientY - 180),
+          width: 560,
+          height: 360
+        };
+        contextElement = targetInfo.contextElement;
+        anchor = targetInfo.anchorElement;
+        standalone = targetInfo.standalone;
+      }
+
+      const questionText = nearbyQuestionContext(contextElement);
       const operationId = ++operationNumber;
       const requestId = `answerly-image-${Date.now()}-${operationId}`;
+      const captureId = `answerly-cap-${Date.now()}-${operationId}`;
       activeOperation = operationId;
       activeRequestId = requestId;
-      chrome.runtime.sendMessage({
-        type: "ANSWERLY_IMAGE_REQUEST",
-        requestId,
-        payload: {
-          question: nearbyQuestionContext(visual),
-          imageRect: pointRect,
-          viewport
+      activeCaptureId = captureId;
+
+      let pending = null;
+      try {
+        // Phase 1: Capture the untouched page BEFORE inserting any DOM feedback node.
+        const prep = await chrome.runtime.sendMessage({
+          type: "ANSWERLY_PREPARE_IMAGE_CAPTURE",
+          captureId,
+          payload: {
+            imageRect: pointRect,
+            viewport,
+            isExactCrop: isDragCrop
+          }
+        });
+        if (activeOperation !== operationId) {
+          chrome.runtime.sendMessage({ type: "ANSWERLY_CANCEL_REQUEST", requestId, captureId }).catch(() => {});
+          return;
         }
-      }).then((response) => {
+        if (!prep?.ok) {
+          throw new Error(prep?.error || "Could not capture the image.");
+        }
+
+        // Phase 2: Now insert the pending indicator safely without shifting the captured screenshot.
+        pending = insertImagePendingNode(anchor, "Reading image…", "Answerly", standalone);
+        const response = await chrome.runtime.sendMessage({
+          type: "ANSWERLY_IMAGE_REQUEST",
+          requestId,
+          captureId,
+          payload: {
+            captureId,
+            question: questionText
+          }
+        });
         if (activeOperation !== operationId) return;
         if (!response?.ok) throw new Error(response?.error || "Could not answer the image.");
-        setPageText(pending, formatAnswer(response.result), "Answer");
-      }).catch((error) => {
+        renderCompletedAnswer(pending, formatAnswer(response.result), "Answer");
+      } catch (error) {
         if (activeOperation === operationId && error?.name !== "AbortError") {
-          pending.textContent = `Answerly: ${error.message || "Could not answer the image."} (click to dismiss)`;
-          pending.setAttribute("aria-live", "polite");
-        } else {
+          const message = `Answerly: ${error?.message || "Could not answer the image."} (click to dismiss)`;
+          if (pending) setStatusBannerText(pending, message);
+          else {
+            pending = insertImagePendingNode(anchor, error?.message || "Could not answer the image.", "Answerly", standalone);
+            setStatusBannerText(pending, message);
+          }
+        } else if (pending) {
           pending.remove();
         }
-      }).finally(() => {
+      } finally {
         if (activeOperation === operationId) {
           activeOperation = 0;
           activeRequestId = "";
+          activeCaptureId = "";
         }
-      });
+      }
     };
+
+    captureClickSuppressHandler = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+    };
+
     imageKeyHandler = (event) => {
       if (event.key !== "Escape") return;
+      dragState = null;
       disarmImageCapture();
     };
-    document.addEventListener("click", imageClickHandler, true);
+
+    document.addEventListener("pointerdown", pointerDownHandler, true);
+    document.addEventListener("pointermove", pointerMoveHandler, true);
+    document.addEventListener("pointerup", pointerUpHandler, true);
+    document.addEventListener("click", captureClickSuppressHandler, true);
     document.addEventListener("keydown", imageKeyHandler, true);
   }
 
   function disarmImageCapture() {
     imageCaptureArmed = false;
-    if (imageClickHandler) document.removeEventListener("click", imageClickHandler, true);
+    document.documentElement.style.cursor = previousDocumentCursor;
+    previousDocumentCursor = "";
+    if (cropBox) {
+      cropBox.remove();
+      cropBox = null;
+    }
+    if (pointerDownHandler) document.removeEventListener("pointerdown", pointerDownHandler, true);
+    if (pointerMoveHandler) document.removeEventListener("pointermove", pointerMoveHandler, true);
+    if (pointerUpHandler) document.removeEventListener("pointerup", pointerUpHandler, true);
+    if (captureClickSuppressHandler) {
+      const handler = captureClickSuppressHandler;
+      setTimeout(() => document.removeEventListener("click", handler, true), 50);
+    }
     if (imageKeyHandler) document.removeEventListener("keydown", imageKeyHandler, true);
-    imageClickHandler = null;
+    pointerDownHandler = null;
+    pointerMoveHandler = null;
+    pointerUpHandler = null;
+    captureClickSuppressHandler = null;
     imageKeyHandler = null;
     if (!activeRequestId) activeOperation = 0;
   }
 
+  function resolveClickedVisual(target, clientX, clientY) {
+    const visualSelector = "img,canvas,svg,video,[role='img'],picture";
+    if (typeof document.elementsFromPoint === "function") {
+      for (const el of document.elementsFromPoint(clientX, clientY)) {
+        if (el.closest?.(`[${OUTPUT_ATTR}]`)) continue;
+        if (el.matches?.(visualSelector)) return el;
+      }
+    }
+    const closestVisual = target.closest?.(visualSelector);
+    if (closestVisual) return closestVisual;
+    const childVisuals = target.querySelectorAll?.("img,canvas,svg,picture");
+    if (childVisuals?.length === 1) return childVisuals[0];
+    return target;
+  }
+
+  function isStandaloneImagePage() {
+    if (!document.body) return false;
+    const children = [...document.body.children].filter((el) => !el.hasAttribute(OUTPUT_ATTR));
+    return children.length === 1 && ["IMG", "SVG", "CANVAS", "PICTURE"].includes(children[0].tagName);
+  }
+
+  function visibleRect(element, vw, vh) {
+    if (!element?.getBoundingClientRect) return null;
+    const rect = element.getBoundingClientRect();
+    const x = Math.max(0, rect.left);
+    const y = Math.max(0, rect.top);
+    const right = Math.min(vw, rect.right);
+    const bottom = Math.min(vh, rect.bottom);
+    const width = right - x;
+    const height = bottom - y;
+    if (width < 4 || height < 4) return null;
+    return { x, y, width, height, right, bottom };
+  }
+
+  function countChoiceCandidates(root) {
+    if (!root?.querySelectorAll) return 0;
+    return root.querySelectorAll('input[type="radio"], [role="radio"]').length;
+  }
+
+  function findCaptureTarget(clicked, visual, viewport) {
+    const vw = viewport.width;
+    const vh = viewport.height;
+    if (isStandaloneImagePage()) {
+      return {
+        rect: visibleRect(visual, vw, vh) || visibleRect(clicked, vw, vh),
+        contextElement: visual,
+        anchorElement: visual,
+        standalone: true
+      };
+    }
+
+    const baseRect = visibleRect(visual, vw, vh) || visibleRect(clicked, vw, vh);
+    if (!baseRect) {
+      return { rect: null, contextElement: visual, anchorElement: findQuestionBlock(visual), standalone: false };
+    }
+
+    let bestContainer = null;
+    let bestRect = baseRect;
+    let current = visual.parentElement;
+    for (let depth = 0; current && current !== document.body && current !== document.documentElement && depth < 6; depth += 1) {
+      const candRect = visibleRect(current, vw, vh);
+      if (!candRect) {
+        current = current.parentElement;
+        continue;
+      }
+      if (candRect.width > vw * 0.94 && candRect.height > vh * 0.88) break;
+      if (bestContainer && countChoiceCandidates(bestContainer) >= 2 && countChoiceCandidates(current) > 10) {
+        break;
+      }
+      const isSemanticContainer = current.matches?.('figure,article,section,fieldset,form,li,td,[role="listitem"],[role="group"],[role="region"]') ||
+        /question|quiz|problem|card|item|prompt|stem|exercise|task/i.test(`${current.className || ""} ${current.id || ""}`);
+      if (candRect.height <= vh * 0.88 && candRect.width <= vw * 0.94 &&
+          (isSemanticContainer || candRect.height <= Math.max(vh * 0.85, baseRect.height * 4))) {
+        bestContainer = current;
+        bestRect = candRect;
+      }
+      current = current.parentElement;
+    }
+
+    if (!bestContainer) {
+      let union = { ...baseRect };
+      const mergeSibling = (sib) => {
+        if (!sib || sib.nodeType !== Node.ELEMENT_NODE) return false;
+        if (sib.hasAttribute(OUTPUT_ATTR) || ["SCRIPT", "STYLE", "NOSCRIPT"].includes(sib.tagName)) return false;
+        const r = visibleRect(sib, vw, vh);
+        if (!r || r.height > vh * 0.55) return false;
+        const gap = Math.max(0, r.y - union.bottom, union.y - r.bottom);
+        if (gap > 140) return false;
+        const nextLeft = Math.min(union.x, r.x);
+        const nextTop = Math.min(union.y, r.y);
+        const nextRight = Math.max(union.right, r.right);
+        const nextBottom = Math.max(union.bottom, r.bottom);
+        union = {
+          x: nextLeft,
+          y: nextTop,
+          right: nextRight,
+          bottom: nextBottom,
+          width: nextRight - nextLeft,
+          height: nextBottom - nextTop
+        };
+        return true;
+      };
+
+      let prev = visual.previousElementSibling;
+      for (let count = 0; prev && count < 2; prev = prev.previousElementSibling) {
+        if (mergeSibling(prev)) count += 1;
+      }
+      let next = visual.nextElementSibling;
+      for (let count = 0; next && count < 2; next = next.nextElementSibling) {
+        if (mergeSibling(next)) count += 1;
+      }
+      bestRect = union;
+    }
+
+    return {
+      rect: { x: bestRect.x, y: bestRect.y, width: bestRect.width, height: bestRect.height },
+      contextElement: bestContainer || visual.parentElement || visual,
+      anchorElement: bestContainer || findQuestionBlock(visual),
+      standalone: false
+    };
+  }
+
+  function insertImagePendingNode(anchor, text, label, standalone) {
+    if (standalone) {
+      const node = document.createElement("div");
+      node.setAttribute(OUTPUT_ATTR, "answer");
+      node.setAttribute("role", "note");
+      const bgColor = document.body ? getComputedStyle(document.body).backgroundColor : "";
+      const isDark = isDarkBackgroundColor(bgColor);
+      node.style.position = "fixed";
+      node.style.left = "16px";
+      node.style.right = "16px";
+      node.style.bottom = "16px";
+      node.style.width = "auto";
+      node.style.maxWidth = "720px";
+      node.style.margin = "0 auto";
+      node.style.zIndex = "2147483646";
+      node.style.padding = "10px 14px";
+      node.style.borderRadius = "10px";
+      node.style.fontFamily = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
+      node.style.fontSize = "14px";
+      node.style.lineHeight = "1.45";
+      node.style.whiteSpace = "pre-wrap";
+      node.style.background = isDark ? "rgba(28, 28, 30, 0.92)" : "rgba(255, 255, 255, 0.94)";
+      node.style.color = isDark ? "#f5f5f7" : "#1d1d1f";
+      node.style.border = isDark ? "1px solid rgba(255,255,255,0.16)" : "1px solid rgba(0,0,0,0.12)";
+      node.style.boxShadow = "0 4px 20px rgba(0,0,0,0.22)";
+      node.style.cursor = "pointer";
+      node.textContent = `${label ? `${label}: ` : ""}${text}`;
+      node.title = "Click to dismiss";
+      node._answerlyPendingDismiss = () => node.remove();
+      node.addEventListener("click", node._answerlyPendingDismiss, { once: true });
+      document.body.append(node);
+      return node;
+    }
+
+    let safeAnchor = anchor;
+    if (safeAnchor?.parentElement) {
+      const parentStyle = getComputedStyle(safeAnchor.parentElement);
+      if (parentStyle.display.includes("flex") && parentStyle.flexDirection.startsWith("row")) {
+        safeAnchor = safeAnchor.parentElement;
+      }
+    }
+    return insertPendingNode(safeAnchor, text, label);
+  }
+
+  function isDarkBackgroundColor(rgbString) {
+    const match = String(rgbString || "").match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
+    if (!match) return false;
+    const luminance = (0.299 * Number(match[1]) + 0.587 * Number(match[2]) + 0.114 * Number(match[3])) / 255;
+    return luminance < 0.5;
+  }
+
   function nearbyQuestionContext(element) {
-    const block = findQuestionBlock(element);
-    let text = (block?.innerText || "").replace(/\s+/g, " ").trim();
-    if (text.length < 40 && block?.parentElement) {
-      text = (block.parentElement.innerText || text).replace(/\s+/g, " ").trim();
+    const block = element || document.body;
+    const readCleanText = (node) => {
+      if (!node) return "";
+      const clone = node.cloneNode(true);
+      clone.querySelectorAll?.(`[${OUTPUT_ATTR}]`).forEach((el) => el.remove());
+      return (clone.innerText || clone.textContent || "").replace(/\s+/g, " ").trim();
+    };
+    let text = readCleanText(block);
+    if (text.length < 40 && block?.parentElement && block.parentElement !== document.body) {
+      text = readCleanText(block.parentElement) || text;
     }
     return text.slice(0, 5000) || "Read the question shown in the captured image and answer it.";
   }
@@ -335,7 +660,7 @@
       pending.remove();
       return;
     }
-    setPageText(pending, answerText, "Answer");
+    renderCompletedAnswer(pending, answerText, "Answer");
   }
 
   function finishEditorStatus(token, text) {
@@ -425,7 +750,6 @@
     currentSelection.removeAllRanges();
     currentSelection.addRange(insertionRange);
     const insertionText = editorInsertionText(target.text, answerText);
-    // execCommand lets many rich-text and contenteditable editors handle the edit natively.
     if (document.execCommand("insertText", false, insertionText)) return true;
     const inserted = document.createTextNode(insertionText);
     insertionRange.insertNode(inserted);
@@ -491,47 +815,109 @@
 
   function findRadioOptions(anchor) {
     for (const root of ancestorRoots(anchor)) {
-      const radios = [...root.querySelectorAll('input[type="radio"]')]
-        .filter((input) => !input.disabled && !input.closest(`[${OUTPUT_ATTR}]`));
-      const groups = new Map();
-      for (const input of radios) {
-        const form = input.form || root;
-        const groupName = input.name || "";
-        let byName = groups.get(form);
-        if (!byName) groups.set(form, byName = new Map());
-        const key = groupName || input.closest('fieldset,[role="radiogroup"]') || input.parentElement;
-        let group = byName.get(key);
-        if (!group) byName.set(key, group = []);
-        group.push(input);
+      const native = findNativeInputGroup(root, 'input[type="radio"]', true);
+      if (native.length >= 2) return stampOptions(native);
+
+      const ariaRadios = findAriaOptions(root, '[role="radiogroup"]', '[role="radio"]');
+      if (ariaRadios.length >= 2) return stampOptions(ariaRadios);
+
+      const checkboxes = findNativeInputGroup(root, 'input[type="checkbox"]', false);
+      if (checkboxes.length >= 2) return stampOptions(checkboxes);
+
+      const ariaCheckboxes = findAriaOptions(root, '[role="group"],fieldset', '[role="checkbox"]');
+      if (ariaCheckboxes.length >= 2) return stampOptions(ariaCheckboxes);
+
+      const listboxOptions = findAriaOptions(root, '[role="listbox"]', '[role="option"]');
+      if (listboxOptions.length >= 2) return stampOptions(listboxOptions);
+
+      const letteredLists = [...root.querySelectorAll('ol[type="A"], ol[type="a"]')]
+        .filter((list) => !list.closest(`[${OUTPUT_ATTR}]`));
+      for (const list of letteredLists) {
+        const items = [...list.children]
+          .filter((child) => child.tagName === "LI")
+          .slice(0, MAX_OPTIONS)
+          .map((item, index) => ({
+            id: String(index),
+            text: (item.innerText || "").trim().replace(/\s+/g, " ").slice(0, 1000),
+            element: item,
+            hadId: false,
+            previousId: null
+          }))
+          .filter((option) => option.text);
+        if (items.length >= 2) return stampOptions(items);
       }
-      const group = [...groups.values()].flatMap((byName) => [...byName.values()])
-        .filter((items) => items.length >= 2)
-        .sort((left, right) => right.length - left.length)[0];
-      if (group) return stampOptions(group.slice(0, MAX_OPTIONS).map((input, index) => {
-        const label = input.labels?.[0] || input.closest("label");
-        const element = label || input.parentElement || input;
+    }
+    return [];
+  }
+
+  function findNativeInputGroup(root, selector, preferLargest) {
+    const inputs = [...root.querySelectorAll(selector)]
+      .filter((input) => !input.disabled && !input.closest(`[${OUTPUT_ATTR}]`));
+    if (inputs.length < 2) return [];
+    const groups = new Map();
+    for (const input of inputs) {
+      const form = input.form || root;
+      const groupName = input.name || "";
+      let byName = groups.get(form);
+      if (!byName) groups.set(form, byName = new Map());
+      const key = groupName || input.closest('fieldset,[role="radiogroup"],[role="group"]') || input.parentElement;
+      let group = byName.get(key);
+      if (!group) byName.set(key, group = []);
+      group.push(input);
+    }
+    const candidates = [...groups.values()]
+      .flatMap((byName) => [...byName.values()])
+      .filter((items) => items.length >= 2);
+    if (!candidates.length) return [];
+    const chosen = preferLargest
+      ? candidates.sort((left, right) => right.length - left.length)[0]
+      : candidates[0];
+    return chosen.slice(0, MAX_OPTIONS).map((input, index) => {
+      const label = input.labels?.[0] || input.closest("label");
+      const element = label || input.parentElement || input;
+      return {
+        id: String(index),
+        text: radioText(input, element),
+        element,
+        input,
+        hadId: false,
+        previousId: null
+      };
+    }).filter((option) => option.text);
+  }
+
+  function findAriaOptions(root, containerSelector, itemSelector) {
+    const containers = [...root.querySelectorAll(containerSelector)]
+      .filter((container) => !container.closest(`[${OUTPUT_ATTR}]`));
+    const searchPools = containers.length ? containers : [root];
+    for (const pool of searchPools) {
+      const items = [...pool.querySelectorAll(itemSelector)]
+        .filter((el) => el.getAttribute("aria-disabled") !== "true" && !el.closest(`[${OUTPUT_ATTR}]`));
+      if (items.length < 2) continue;
+      const mapped = items.slice(0, MAX_OPTIONS).map((element, index) => {
+        const text = (element.innerText || element.getAttribute("aria-label") || element.getAttribute("data-value") || "")
+          .trim()
+          .replace(/\s+/g, " ")
+          .slice(0, 1000);
         return {
           id: String(index),
-          text: radioText(input, element),
+          text,
           element,
-          input,
           hadId: false,
           previousId: null
         };
-      }).filter((option) => option.text));
+      }).filter((option) => option.text);
+      if (mapped.length >= 2) return mapped;
     }
     return [];
   }
 
   function findNearbyContextOptions(anchor) {
-    for (const root of ancestorRoots(anchor)) {
-      const labels = [...root.querySelectorAll('input[type="radio"]')]
-        .map((input) => {
-          const element = input.labels?.[0] || input.closest("label") || input.parentElement;
-          return element ? radioText(input, element) : "";
-        })
-        .filter(Boolean);
-      if (labels.length >= 2) return labels.slice(0, MAX_OPTIONS).map((text, index) => ({ id: String(index), text }));
+    const options = findRadioOptions(anchor);
+    if (options.length >= 2) {
+      const clean = options.map(({ id, text }) => ({ id, text }));
+      restoreOptionAttributes(options);
+      return clean;
     }
     return [];
   }
@@ -560,7 +946,7 @@
     }
   }
 
-  function insertPageText(anchor, text, label, insertionPoint = null) {
+  function insertPendingNode(anchor, text, label, insertionPoint = null) {
     const node = document.createElement("div");
     node.setAttribute(OUTPUT_ATTR, "answer");
     node.setAttribute("role", "note");
@@ -570,10 +956,12 @@
     node.style.display = "block";
     node.style.width = "100%";
     node.style.cursor = "pointer";
-    node.style.opacity = "0.9";
+    node.style.opacity = "0.85";
     node.textContent = `${label ? `${label}: ` : ""}${text}`;
-    node.title = "Click to remove this answer";
-    node.addEventListener("click", () => node.remove(), { once: true });
+    node.title = "Click to dismiss";
+    node._answerlyPendingDismiss = () => node.remove();
+    node.addEventListener("click", node._answerlyPendingDismiss, { once: true });
+
     let insertedAtSelection = false;
     if (insertionPoint?.startContainer?.isConnected) {
       try {
@@ -592,8 +980,151 @@
     return node;
   }
 
-  function setPageText(node, text, label) {
-    node.textContent = `${label ? `${label}: ` : ""}${text}`;
+  function setStatusBannerText(node, text) {
+    node.replaceChildren(document.createTextNode(text));
+    node.setAttribute("aria-live", "polite");
+    node.style.cursor = "pointer";
+    node.style.userSelect = "none";
+    if (!node._answerlyPendingDismiss) {
+      node._answerlyPendingDismiss = () => node.remove();
+      node.addEventListener("click", node._answerlyPendingDismiss, { once: true });
+    }
+  }
+
+  function renderCompletedAnswer(node, text, label) {
+    if (node._answerlyPendingDismiss) {
+      node.removeEventListener("click", node._answerlyPendingDismiss);
+      node._answerlyPendingDismiss = null;
+    }
+    node.replaceChildren();
+    node.title = "";
+    node.style.opacity = "0.92";
+    node.style.cursor = "text";
+    node.style.userSelect = "text";
+
+    const fullText = `${label ? `${label}: ` : ""}${text}`;
+    const textSpan = document.createElement("span");
+    textSpan.textContent = fullText;
+
+    const actions = document.createElement("span");
+    actions.style.display = "inline-flex";
+    actions.style.alignItems = "center";
+    actions.style.gap = "4px";
+    actions.style.marginLeft = "8px";
+    actions.style.verticalAlign = "middle";
+    actions.style.opacity = "0";
+    actions.style.transition = "opacity 150ms ease";
+    actions.style.userSelect = "none";
+
+    const copyBtn = createInlineActionButton("Copy answer", makeCopySvg());
+    const dismissBtn = createInlineActionButton("Dismiss answer", makeDismissSvg());
+
+    copyBtn.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      const copied = await copyToClipboard(text);
+      if (copied) {
+        copyBtn.replaceChildren(makeCheckSvg());
+        setTimeout(() => {
+          if (copyBtn.isConnected) copyBtn.replaceChildren(makeCopySvg());
+        }, 1400);
+      }
+    });
+    dismissBtn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      node.remove();
+    });
+
+    const showActions = () => { actions.style.opacity = "0.8"; };
+    const hideActions = () => { actions.style.opacity = "0"; };
+    node.addEventListener("mouseenter", showActions);
+    node.addEventListener("mouseleave", hideActions);
+    node.addEventListener("focusin", showActions);
+    node.addEventListener("focusout", hideActions);
+
+    actions.append(copyBtn, dismissBtn);
+    node.append(textSpan, actions);
+  }
+
+  function createInlineActionButton(label, svgEl) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.setAttribute("aria-label", label);
+    btn.title = label;
+    btn.style.display = "inline-flex";
+    btn.style.alignItems = "center";
+    btn.style.justifyContent = "center";
+    btn.style.width = "22px";
+    btn.style.height = "22px";
+    btn.style.padding = "0";
+    btn.style.border = "none";
+    btn.style.borderRadius = "4px";
+    btn.style.background = "transparent";
+    btn.style.color = "inherit";
+    btn.style.cursor = "pointer";
+    btn.style.opacity = "0.75";
+    btn.append(svgEl);
+    return btn;
+  }
+
+  function createSvg(paths) {
+    const svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("width", "13");
+    svg.setAttribute("height", "13");
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "1.75");
+    svg.setAttribute("stroke-linecap", "round");
+    svg.setAttribute("stroke-linejoin", "round");
+    svg.setAttribute("aria-hidden", "true");
+    for (const [tag, attrs] of paths) {
+      const el = document.createElementNS(SVG_NS, tag);
+      for (const [key, value] of Object.entries(attrs)) el.setAttribute(key, value);
+      svg.append(el);
+    }
+    return svg;
+  }
+
+  function makeCopySvg() {
+    return createSvg([
+      ["rect", { x: "9", y: "9", width: "13", height: "13", rx: "2", ry: "2" }],
+      ["path", { d: "M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" }]
+    ]);
+  }
+
+  function makeCheckSvg() {
+    return createSvg([["polyline", { points: "20 6 9 17 4 12" }]]);
+  }
+
+  function makeDismissSvg() {
+    return createSvg([
+      ["line", { x1: "18", y1: "6", x2: "6", y2: "18" }],
+      ["line", { x1: "6", y1: "6", x2: "18", y2: "18" }]
+    ]);
+  }
+
+  async function copyToClipboard(text) {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch {
+      // Fall back to execCommand below.
+    }
+    try {
+      const helper = document.createElement("textarea");
+      helper.value = text;
+      helper.style.position = "fixed";
+      helper.style.opacity = "0";
+      document.body.append(helper);
+      helper.select();
+      const ok = document.execCommand("copy");
+      helper.remove();
+      return ok;
+    } catch {
+      return false;
+    }
   }
 
   function formatAnswer(result) {
@@ -626,7 +1157,7 @@
   }
 
   function showPageMessage(message, anchor) {
-    const node = insertPageText(findQuestionBlock(elementForNode(anchor) || document.body), message, "Answerly");
-    node.setAttribute("aria-live", "polite");
+    const node = insertPendingNode(findQuestionBlock(elementForNode(anchor) || document.body), message, "Answerly");
+    setStatusBannerText(node, `Answerly: ${message} (click to dismiss)`);
   }
 })();

@@ -1,21 +1,26 @@
 import { findRelevantPassages } from "./study-store.js";
 import { buildAnswerMessages } from "./answer-prompt.js";
+import {
+  DEFAULT_SETTINGS,
+  REASONING_EFFORTS,
+  LEGACY_MODEL_MIGRATIONS,
+  resolveActiveModel,
+  getModelMeta
+} from "./shared/config.js";
 
 const API_URL = "https://api.deeprelay.ai/v1/chat/completions";
-const MODEL_IDS = new Set([
-  "deeprelay/deepseek-v4.1-flash",
-  "deeprelay/kimi-k3",
-  "deeprelay/glm-5.3",
-  "deeprelay/glm-5.3-flash"
-]);
-const VISION_MODEL_IDS = new Set([
-  "deeprelay/deepseek-v4.1-flash",
-  "deeprelay/kimi-k3",
-  "deeprelay/glm-5.3-flash"
-]);
+const MODELS_URL = "https://api.deeprelay.ai/v1/models";
 const MAX_QUESTION_CHARS = 12000;
 const MAX_OPTIONS = 40;
 const activeRequests = new Map();
+const pendingCaptures = new Map();
+
+function prunePendingCaptures() {
+  const cutoff = Date.now() - 30_000;
+  for (const [id, entry] of pendingCaptures) {
+    if (entry.createdAt < cutoff) pendingCaptures.delete(id);
+  }
+}
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.removeAll(() => {
@@ -80,8 +85,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           : replaceSupportedEditorSelection;
     const args = isRead || isShow
       ? [token]
-      : isFinish ? [token, String(message.text ?? "").slice(0, MAX_QUESTION_CHARS)]
-        : [token, String(message.text ?? "").slice(0, MAX_QUESTION_CHARS)];
+      : [token, String(message.text ?? "").slice(0, MAX_QUESTION_CHARS)];
     chrome.scripting.executeScript({
       target: { tabId },
       world: "MAIN",
@@ -99,10 +103,50 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         : { ok: false, replaced: false }));
     return true;
   }
+
   if (message?.type === "ANSWERLY_CANCEL_REQUEST") {
     activeRequests.get(String(message.requestId))?.abort();
+    if (message.captureId) pendingCaptures.delete(String(message.captureId));
     return false;
   }
+
+  if (message?.type === "ANSWERLY_PREPARE_IMAGE_CAPTURE") {
+    const captureId = String(message.captureId ?? "");
+    const tabId = _sender.tab?.id;
+    const windowId = _sender.tab?.windowId;
+    if (!captureId || !Number.isInteger(tabId) || !Number.isInteger(windowId)) {
+      sendResponse({ ok: false, error: "Could not capture this tab. Try Alt+R again." });
+      return false;
+    }
+    (async () => {
+      const settings = await loadActiveSettings();
+      const modelMeta = getModelMeta(settings.activeModel);
+      if (!modelMeta.vision) {
+        throw new Error("Alt+R needs a vision model. Choose DeepSeek V4.1 Flash, Kimi K3.1 Pro, or GLM 5.3 Flash in Answerly settings.");
+      }
+      const imageDataUrl = await captureImageRegion(
+        tabId,
+        windowId,
+        message.payload?.imageRect,
+        message.payload?.viewport,
+        Boolean(message.payload?.isExactCrop)
+      );
+      prunePendingCaptures();
+      pendingCaptures.set(captureId, { imageDataUrl, createdAt: Date.now() });
+      return { ok: true };
+    })()
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ ok: false, error: safeErrorMessage(error) }));
+    return true;
+  }
+
+  if (message?.type === "ANSWERLY_TEST_API_KEY") {
+    testApiKey(message.apiKey, message.model)
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ ok: false, error: safeErrorMessage(error) }));
+    return true;
+  }
+
   if (message?.type === "ANSWERLY_IMAGE_REQUEST") {
     const requestId = String(message.requestId ?? "");
     const tabId = _sender.tab?.id;
@@ -113,7 +157,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
     const controller = new AbortController();
     activeRequests.set(requestId, controller);
-    answerImageQuestion(message.payload, tabId, windowId, controller.signal)
+    const payload = message.captureId
+      ? { ...message.payload, captureId: message.captureId }
+      : message.payload;
+    answerImageQuestion(payload, tabId, windowId, controller.signal)
       .then((result) => sendResponse({ ok: true, result }))
       .catch((error) => sendResponse({ ok: false, error: safeErrorMessage(error) }))
       .finally(() => {
@@ -121,6 +168,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       });
     return true;
   }
+
   if (message?.type !== "ANSWERLY_ANSWER_REQUEST") return false;
 
   const requestId = String(message.requestId ?? "");
@@ -130,7 +178,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
   const controller = new AbortController();
   activeRequests.set(requestId, controller);
-  answerQuestion(message.payload, controller.signal)
+  answerTextQuestion(message.payload, controller.signal)
     .then((result) => sendResponse({ ok: true, result }))
     .catch((error) => sendResponse({ ok: false, error: safeErrorMessage(error) }))
     .finally(() => {
@@ -375,11 +423,21 @@ function finishSupportedEditorStatus(token, replacementText) {
   return replaced;
 }
 
-async function answerQuestion(payload, signal) {
-  const { apiKey = "", model = "deeprelay/deepseek-v4.1-flash", answerInstructions = "" } = await chrome.storage.local.get(["apiKey", "model", "answerInstructions"]);
-  if (!apiKey.trim()) throw new Error("Add your Deep Relay API key in the extension settings first.");
-  if (!MODEL_IDS.has(model)) throw new Error("Choose a supported model in the extension settings.");
+async function loadActiveSettings() {
+  const settings = await chrome.storage.local.get(DEFAULT_SETTINGS);
+  const rawModel = String(settings.model || "");
+  if (Object.hasOwn(LEGACY_MODEL_MIGRATIONS, rawModel)) {
+    const migrated = LEGACY_MODEL_MIGRATIONS[rawModel];
+    settings.model = migrated;
+    chrome.storage.local.set({ model: migrated }).catch(() => {});
+  }
+  return {
+    ...settings,
+    activeModel: resolveActiveModel(settings)
+  };
+}
 
+async function answerTextQuestion(payload, signal) {
   const mode = payload?.mode === "multiple-choice" ? "multiple-choice" : "words";
   const question = String(payload?.question ?? "").trim().slice(0, MAX_QUESTION_CHARS);
   if (!question) throw new Error("Highlight a question before using the shortcut.");
@@ -389,47 +447,141 @@ async function answerQuestion(payload, signal) {
         text: String(option.text ?? "").trim().slice(0, 1000)
       })).filter((option) => option.text)
     : [];
-  const reference = await findRelevantPassages(question);
-  const passages = reference.passages;
   if (mode === "multiple-choice" && options.length < 2) {
-    throw new Error("No multiple-choice radio options were found near the highlighted question.");
+    throw new Error("No multiple-choice options were found near the highlighted question.");
   }
+  return requestAnswer({ mode, question, options, signal });
+}
 
-  const schema = mode === "multiple-choice"
-    ? {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          answer: { type: "string" },
-          explanation: { type: "string" },
-          correctOptionId: { type: "string" },
-          citations: citationSchema()
-        },
-        required: ["answer", "explanation", "correctOptionId", "citations"]
-      }
-    : {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          answer: { type: "string" },
-          explanation: { type: "string" },
-          correctOptionId: { type: "string" },
-          citations: citationSchema()
-        },
-        required: ["answer", "explanation", "correctOptionId", "citations"]
-      };
+async function answerImageQuestion(payload, tabId, windowId, signal) {
+  const settings = await loadActiveSettings();
+  const modelMeta = getModelMeta(settings.activeModel);
+  if (!modelMeta.vision) {
+    throw new Error("Alt+R needs a vision model. Choose DeepSeek V4.1 Flash, Kimi K3.1 Pro, or GLM 5.3 Flash in Answerly settings.");
+  }
+  const captureId = String(payload?.captureId ?? "");
+  let imageDataUrl = "";
+  if (captureId && pendingCaptures.has(captureId)) {
+    imageDataUrl = pendingCaptures.get(captureId).imageDataUrl;
+    pendingCaptures.delete(captureId);
+  } else {
+    imageDataUrl = await captureImageRegion(
+      tabId,
+      windowId,
+      payload?.imageRect,
+      payload?.viewport,
+      Boolean(payload?.isExactCrop)
+    );
+  }
+  const question = String(payload?.question ?? "Read and answer the question shown in the attached image.")
+    .trim().slice(0, MAX_QUESTION_CHARS);
+  return requestAnswer({
+    mode: "image",
+    question,
+    options: [],
+    imageDataUrl,
+    settings,
+    signal
+  });
+}
+
+async function captureImageRegion(tabId, windowId, rect, viewport, isExactCrop = false) {
+  if (![rect?.x, rect?.y, rect?.width, rect?.height, viewport?.width, viewport?.height]
+    .every((value) => Number.isFinite(Number(value)))) {
+    throw new Error("Could not identify the captured image area. Press Alt+R and try again.");
+  }
+  const vw = Number(viewport.width);
+  const vh = Number(viewport.height);
+  if (vw <= 0 || vh <= 0) {
+    throw new Error("Could not identify the visible page size. Try Alt+R again.");
+  }
+  const rawLeft = Math.max(0, Number(rect.x));
+  const rawTop = Math.max(0, Number(rect.y));
+  const rawRight = Math.min(vw, Number(rect.x) + Number(rect.width));
+  const rawBottom = Math.min(vh, Number(rect.y) + Number(rect.height));
+  if (rawRight <= rawLeft || rawBottom <= rawTop) {
+    throw new Error("The selected image is outside the visible page. Scroll it into view and try Alt+R again.");
+  }
+  let screenshot;
+  try {
+    // Capture the visible tab only after Alt+R is invoked and the user selects the target area.
+    screenshot = await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
+  } catch {
+    throw new Error("Could not capture this page. Check that the tab is active, then try Alt+R again.");
+  }
+  const source = await createImageBitmap(await (await fetch(screenshot)).blob());
+  const scaleX = source.width / vw;
+  const scaleY = source.height / vh;
+  const padX = isExactCrop ? 0 : Math.max(16, (rawRight - rawLeft) * 0.03);
+  const padY = isExactCrop ? 0 : Math.max(16, (rawBottom - rawTop) * 0.03);
+  const x = Math.max(0, Math.floor((rawLeft - padX) * scaleX));
+  const y = Math.max(0, Math.floor((rawTop - padY) * scaleY));
+  const right = Math.min(source.width, Math.ceil((rawRight + padX) * scaleX));
+  const bottom = Math.min(source.height, Math.ceil((rawBottom + padY) * scaleY));
+  if (right <= x || bottom <= y) {
+    source.close();
+    throw new Error("The selected image is outside the visible page. Scroll it into view and try Alt+R again.");
+  }
+  const maxDimension = 2200;
+  const shrink = Math.min(1, maxDimension / Math.max(right - x, bottom - y));
+  const canvas = new OffscreenCanvas(Math.max(1, Math.round((right - x) * shrink)), Math.max(1, Math.round((bottom - y) * shrink)));
+  const context = canvas.getContext("2d", { alpha: false });
+  if (!context) {
+    source.close();
+    throw new Error("Could not process the captured image region.");
+  }
+  context.drawImage(source, x, y, right - x, bottom - y, 0, 0, canvas.width, canvas.height);
+  source.close();
+  const blob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.88 });
+  if (blob.size > 5 * 1024 * 1024) {
+    throw new Error("The captured image is too large to send safely. Try capturing a smaller area.");
+  }
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  }
+  return `data:image/jpeg;base64,${btoa(binary)}`;
+}
+
+async function requestAnswer({ mode, question, options = [], imageDataUrl = "", settings: preloadedSettings = null, signal }) {
+  const settings = preloadedSettings || await loadActiveSettings();
+  const apiKey = String(settings.apiKey || "").trim();
+  if (!apiKey) throw new Error("Add your Deep Relay API key in the extension settings first.");
+  const activeModel = settings.activeModel;
+  if (!activeModel) throw new Error("Choose a model in the extension settings.");
+
+  const groundingMode = settings.groundingMode === "hybrid" ? "hybrid" : "strict";
+  const reference = await findRelevantPassages(question, 6, 10_000, {
+    choices: options.map((option) => option.text),
+    activeSetId: String(settings.activeSetId || ""),
+    onlyEnabled: true
+  });
+  const passages = reference.passages;
 
   const { response, body } = await postAnswerRequest({
     apiKey,
-    model,
-    messages: buildAnswerMessages({ mode, question, options, hasFiles: reference.hasFiles, passages, customInstructions: answerInstructions }),
-    schema,
+    model: activeModel,
+    reasoningEffort: settings.reasoningEffort,
+    messages: buildAnswerMessages({
+      mode,
+      question,
+      options,
+      hasFiles: reference.hasFiles,
+      passages,
+      imageDataUrl,
+      customInstructions: settings.answerInstructions,
+      groundingMode
+    }),
+    schema: answerSchema(),
     signal
   });
-  if (!response.ok) {
-    throw new Error(formatDeepRelayError(response, body));
-  }
-  const content = body?.choices?.[0]?.message?.content;
+  if (!response.ok) throw new Error(formatDeepRelayError(response, body));
+
+  const choice = body?.choices?.[0];
+  const finishReason = choice?.finish_reason || "";
+  const content = choice?.message?.content;
   const text = typeof content === "string"
     ? content.trim()
     : Array.isArray(content)
@@ -437,12 +589,7 @@ async function answerQuestion(payload, signal) {
       : "";
   if (!text) throw new Error("The AI returned an empty answer. Try again.");
 
-  let result;
-  try {
-    result = JSON.parse(text);
-  } catch {
-    throw new Error("The AI response was not valid JSON. Try again.");
-  }
+  const result = parseModelJson(text, finishReason);
   if (typeof result.answer !== "string" || typeof result.explanation !== "string" ||
     (mode === "multiple-choice" && typeof result.correctOptionId !== "string")) {
     throw new Error("The AI response did not contain a valid answer.");
@@ -450,7 +597,7 @@ async function answerQuestion(payload, signal) {
   const correctOptionId = typeof result.correctOptionId === "string" ? result.correctOptionId : "";
   const validIds = new Set(options.map((option) => option.id));
   if (mode === "multiple-choice" && correctOptionId !== "" && !validIds.has(correctOptionId)) {
-    throw new Error("The AI answer did not match any detected radio choice. Try again.");
+    throw new Error("The AI answer did not match any detected choice. Try again.");
   }
   const validCitations = new Set(passages.map((passage) => `${passage.file}\u0000${passage.location}`));
   const citations = Array.isArray(result.citations)
@@ -464,135 +611,58 @@ async function answerQuestion(payload, signal) {
   };
 }
 
-async function answerImageQuestion(payload, tabId, windowId, signal) {
-  const {
-    apiKey = "",
-    model = "deeprelay/deepseek-v4.1-flash",
-    answerInstructions = ""
-  } = await chrome.storage.local.get(["apiKey", "model", "answerInstructions"]);
-  if (!apiKey.trim()) throw new Error("Add your Deep Relay API key in the extension settings first.");
-  if (!VISION_MODEL_IDS.has(model)) {
-    throw new Error("Alt+R needs a vision model. Choose DeepSeek V4.1 Flash, Kimi K3, or GLM 5.3 Flash in Answerly settings.");
-  }
-  const imageDataUrl = await captureImageRegion(tabId, windowId, payload?.imageRect, payload?.viewport);
-  const question = String(payload?.question ?? "Read and answer the question shown in the attached image.")
-    .trim().slice(0, MAX_QUESTION_CHARS);
-  const reference = await findRelevantPassages(question);
-  const passages = reference.passages;
-  return requestAnswer({
-    mode: "image",
-    question,
-    options: [],
-    hasFiles: reference.hasFiles,
-    passages,
-    imageDataUrl,
-    customInstructions: answerInstructions,
-    signal
-  });
-}
-
-async function captureImageRegion(tabId, windowId, rect, viewport) {
-  if (![rect?.x, rect?.y, rect?.width, rect?.height, viewport?.width, viewport?.height]
-    .every((value) => Number.isFinite(Number(value)))) {
-    throw new Error("Could not identify the clicked image area. Press Alt+R and click the image again.");
-  }
-  let screenshot;
+function parseModelJson(text, finishReason) {
+  const stripped = String(text || "")
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
   try {
-    // Capture the visible tab only after Alt+R is invoked and the user clicks the target area.
-    screenshot = await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
+    return JSON.parse(stripped);
   } catch {
-    throw new Error("Could not capture this page. Check that the tab is active, then try Alt+R again.");
+    const firstBrace = stripped.indexOf("{");
+    const lastBrace = stripped.lastIndexOf("}");
+    if (firstBrace !== -1 && lastBrace > firstBrace) {
+      try {
+        return JSON.parse(stripped.slice(firstBrace, lastBrace + 1));
+      } catch {
+        // Fall through to structured error message.
+      }
+    }
+    if (finishReason === "length") {
+      throw new Error("The AI response was cut off because it exceeded the length limit. Try a lower thinking level or shorter prompt.");
+    }
+    throw new Error("The AI response was not valid JSON. Try again.");
   }
-  const source = await createImageBitmap(await (await fetch(screenshot)).blob());
-  const scaleX = source.width / Number(viewport.width);
-  const scaleY = source.height / Number(viewport.height);
-  const padX = Math.max(20, Number(rect.width) * 0.04);
-  const padY = Math.max(20, Number(rect.height) * 0.04);
-  const x = Math.max(0, Math.floor((Number(rect.x) - padX) * scaleX));
-  const y = Math.max(0, Math.floor((Number(rect.y) - padY) * scaleY));
-  const right = Math.min(source.width, Math.ceil((Number(rect.x) + Number(rect.width) + padX) * scaleX));
-  const bottom = Math.min(source.height, Math.ceil((Number(rect.y) + Number(rect.height) + padY) * scaleY));
-  if (right <= x || bottom <= y) {
-    source.close();
-    throw new Error("The clicked image is outside the visible page. Scroll it into view and try Alt+R again.");
-  }
-  const maxDimension = 2200;
-  const shrink = Math.min(1, maxDimension / Math.max(right - x, bottom - y));
-  const canvas = new OffscreenCanvas(Math.max(1, Math.round((right - x) * shrink)), Math.max(1, Math.round((bottom - y) * shrink)));
-  const context = canvas.getContext("2d", { alpha: false });
-  if (!context) {
-    source.close();
-    throw new Error("Could not process the clicked image region.");
-  }
-  context.drawImage(source, x, y, right - x, bottom - y, 0, 0, canvas.width, canvas.height);
-  source.close();
-  const blob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.88 });
-  if (blob.size > 5 * 1024 * 1024) throw new Error("The captured image is too large to send safely. Try zooming in and capturing a smaller area.");
-  const bytes = new Uint8Array(await blob.arrayBuffer());
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let index = 0; index < bytes.length; index += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
-  }
-  return `data:image/jpeg;base64,${btoa(binary)}`;
 }
 
-async function requestAnswer({ mode, question, options, hasFiles, passages, imageDataUrl = "", customInstructions = "", signal }) {
-  const { apiKey = "", model = "deeprelay/deepseek-v4.1-flash", reasoningEffort = "medium" } = await chrome.storage.local.get(["apiKey", "model", "reasoningEffort"]);
-  if (!apiKey.trim()) throw new Error("Add your Deep Relay API key in the extension settings first.");
-  if (!MODEL_IDS.has(model)) throw new Error("Choose a supported model in the extension settings.");
-  const { response, body } = await postAnswerRequest({
-    apiKey,
-    model,
-    reasoningEffort,
-    messages: buildAnswerMessages({ mode, question, options, hasFiles, passages, imageDataUrl, customInstructions }),
-    schema: answerSchema(mode),
-    signal
-  });
-  if (!response.ok) throw new Error(formatDeepRelayError(response, body));
-  const content = body?.choices?.[0]?.message?.content;
-  const text = typeof content === "string" ? content.trim()
-    : Array.isArray(content) ? content.map((part) => typeof part?.text === "string" ? part.text : "").join("").trim() : "";
-  if (!text) throw new Error("The AI returned an empty answer. Try again.");
-  let result;
-  try { result = JSON.parse(text); } catch { throw new Error("The AI response was not valid JSON. Try again."); }
-  if (typeof result.answer !== "string" || typeof result.explanation !== "string" ||
-    (mode === "multiple-choice" && typeof result.correctOptionId !== "string")) throw new Error("The AI response did not contain a valid answer.");
-  const correctOptionId = typeof result.correctOptionId === "string" ? result.correctOptionId : "";
-  const validIds = new Set(options.map((option) => option.id));
-  if (mode === "multiple-choice" && correctOptionId !== "" && !validIds.has(correctOptionId)) {
-    throw new Error("The AI answer did not match any detected radio choice. Try again.");
-  }
-  const validCitations = new Set(passages.map((passage) => `${passage.file}\u0000${passage.location}`));
-  const citations = Array.isArray(result.citations)
-    ? result.citations.filter((citation) => validCitations.has(`${citation.file}\u0000${citation.location}`)).slice(0, 3) : [];
+function answerSchema() {
   return {
-    answer: result.answer.slice(0, 4000), explanation: result.explanation.slice(0, 6000),
-    correctOptionId: mode === "multiple-choice" && correctOptionId ? correctOptionId : null,
-    citations
-  };
-}
-
-function answerSchema(mode) {
-  return {
-    type: "object", additionalProperties: false,
+    type: "object",
+    additionalProperties: false,
     properties: {
-      answer: { type: "string" }, explanation: { type: "string" },
-      correctOptionId: { type: "string" }, citations: citationSchema()
+      answer: { type: "string" },
+      explanation: { type: "string" },
+      correctOptionId: { type: "string" },
+      citations: citationSchema()
     },
     required: ["answer", "explanation", "correctOptionId", "citations"]
   };
 }
 
 async function postAnswerRequest({ apiKey, model, reasoningEffort = "medium", messages, schema, signal }) {
+  const modelMeta = getModelMeta(model);
+  const maxTokens = ["high", "xhigh"].includes(reasoningEffort) ? 4096 : 2048;
   const headers = {
     "Content-Type": "application/json",
     Authorization: `Bearer ${apiKey.trim()}`
   };
   const send = (responseFormat) => {
-    const requestBody = { model, messages, max_tokens: 700, response_format: responseFormat };
-    if (["none", "minimal", "low", "medium", "high", "xhigh"].includes(reasoningEffort)) requestBody.reasoning_effort = reasoningEffort;
-    if (model !== "deeprelay/kimi-k3") requestBody.temperature = 0.2;
+    const requestBody = { model, messages, max_tokens: maxTokens, response_format: responseFormat };
+    if (REASONING_EFFORTS.includes(reasoningEffort) && reasoningEffort !== "") {
+      requestBody.reasoning_effort = reasoningEffort;
+    }
+    if (modelMeta.supportsTemperature) requestBody.temperature = 0.2;
     return fetch(API_URL, {
       method: "POST",
       headers,
@@ -601,8 +671,7 @@ async function postAnswerRequest({ apiKey, model, reasoningEffort = "medium", me
     });
   };
 
-  const useJsonModeFirst = model === "deeprelay/kimi-k3";
-  let response = await send(useJsonModeFirst
+  let response = await send(modelMeta.useJsonObjectFirst
     ? { type: "json_object" }
     : { type: "json_schema", json_schema: { name: "answer_result", strict: true, schema } });
   let body = await response.json().catch(() => ({}));
@@ -610,11 +679,51 @@ async function postAnswerRequest({ apiKey, model, reasoningEffort = "medium", me
   const errorMessage = String(body?.error?.message || "").toLowerCase();
   const rejectedSchema = relayErrorCode === "upstream_rejected_request" ||
     errorMessage.includes("upstream model rejected this request as invalid");
-  if (!response.ok && rejectedSchema && !useJsonModeFirst) {
+  if (!response.ok && rejectedSchema && !modelMeta.useJsonObjectFirst) {
     response = await send({ type: "json_object" });
     body = await response.json().catch(() => ({}));
   }
   return { response, body };
+}
+
+async function testApiKey(rawKey, requestedModel) {
+  const apiKey = String(rawKey || "").trim();
+  if (!apiKey) {
+    return { ok: false, error: "Enter your Deep Relay API key first." };
+  }
+  const startedAt = Date.now();
+  const headers = {
+    Authorization: `Bearer ${apiKey}`,
+    "Content-Type": "application/json"
+  };
+  let response = await fetch(MODELS_URL, {
+    method: "GET",
+    headers,
+    signal: AbortSignal.timeout(8000)
+  });
+  if (response.status === 404 || response.status === 405) {
+    const settings = await loadActiveSettings();
+    const model = String(requestedModel || settings.activeModel).trim() || DEFAULT_SETTINGS.model;
+    response = await fetch(API_URL, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: "Reply with ok" }],
+        max_tokens: 1
+      }),
+      signal: AbortSignal.timeout(8000)
+    });
+  }
+  const latencyMs = Date.now() - startedAt;
+  const body = await response.json().catch(() => ({}));
+  if (response.ok) {
+    return { ok: true, latencyMs, message: `Connected (${latencyMs} ms)` };
+  }
+  if (response.status === 401 || response.status === 403) {
+    return { ok: false, error: "API key rejected. Check that you copied the full Deep Relay key." };
+  }
+  return { ok: false, error: formatDeepRelayError(response, body) };
 }
 
 function formatDeepRelayError(response, body) {
@@ -637,5 +746,6 @@ function citationSchema() {
 
 function safeErrorMessage(error) {
   if (error?.name === "AbortError") return "Request cancelled.";
+  if (error?.name === "TimeoutError") return "Deep Relay timed out. Check your connection and try again.";
   return error instanceof Error ? error.message : "Answerly could not answer this question.";
 }

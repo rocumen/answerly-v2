@@ -9,16 +9,16 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/rocumen/answerly.git"
+    "url": "git+https://github.com/rocumen/answerly-v2.git"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "module",
   "bugs": {
-    "url": "https://github.com/rocumen/answerly/issues"
+    "url": "https://github.com/rocumen/answerly-v2/issues"
   },
-  "homepage": "https://github.com/rocumen/answerly#readme",
+  "homepage": "https://github.com/rocumen/answerly-v2#readme",
   "dependencies": {
     "fast-xml-parser": "^5.11.2",
     "fflate": "^0.8.3",
