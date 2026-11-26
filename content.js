@@ -325,6 +325,10 @@
         if (activeOperation !== operationId) return;
         if (!response?.ok) throw new Error(response?.error || "Could not answer the image.");
         renderCompletedAnswer(pending, formatAnswer(response.result), "Answer");
+        if (!standalone && response.result?.answer) {
+          const answerInput = findNearbyImageAnswerInput(clicked, contextElement, pointRect);
+          if (answerInput) fillDetectedAnswerInput(answerInput, response.result.answer);
+        }
       } catch (error) {
         if (activeOperation === operationId && error?.name !== "AbortError") {
           const message = `Answerly: ${error?.message || "Could not answer the image."} (click to dismiss)`;
@@ -507,6 +511,115 @@
       anchorElement: bestContainer || findQuestionBlock(visual),
       standalone: false
     };
+  }
+
+  function rectsIntersect(a, b) {
+    if (!a || !b) return false;
+    const aRight = "right" in a ? a.right : a.x + a.width;
+    const aBottom = "bottom" in a ? a.bottom : a.y + a.height;
+    const bRight = "right" in b ? b.right : b.x + b.width;
+    const bBottom = "bottom" in b ? b.bottom : b.y + b.height;
+    const aLeft = "left" in a ? a.left : a.x;
+    const aTop = "top" in a ? a.top : a.y;
+    const bLeft = "left" in b ? b.left : b.x;
+    const bTop = "top" in b ? b.top : b.y;
+    return aLeft < bRight && aRight > bLeft && aTop < bBottom && aBottom > bTop;
+  }
+
+  function getInputValue(el) {
+    if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) return el.value || "";
+    return el?.innerText || el?.textContent || "";
+  }
+
+  function isEligibleAnswerInput(el) {
+    if (!el?.isConnected) return false;
+    if (el.closest?.(`[${OUTPUT_ATTR}]`) || el.closest?.("header, nav, [role='navigation'], [role='search']")) {
+      return false;
+    }
+    if (el.getAttribute?.("aria-hidden") === "true") return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 20 || rect.height < 16) return false;
+    const style = getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+    const editableOk = isTextControl(el) ||
+      (el.isContentEditable && el.getAttribute("aria-disabled") !== "true" && el.getAttribute("aria-readonly") !== "true");
+    if (!editableOk) return false;
+    return !getInputValue(el).trim() || el.getAttribute("data-answerly-filled") === "true";
+  }
+
+  function findNearbyImageAnswerInput(clicked, contextElement, pointRect) {
+    const inputSelector = 'textarea, input, [contenteditable="true"], [contenteditable=""], [role="textbox"]';
+    const normalizeCandidate = (el) => {
+      if (!el) return null;
+      return el.isContentEditable ? (editableRootFor(el) || el) : el;
+    };
+
+    const directHit = normalizeCandidate(clicked?.closest?.(inputSelector)) || editableRootFor(clicked);
+    if (isEligibleAnswerInput(directHit)) return directHit;
+
+    const candidates = new Set();
+    if (contextElement && contextElement !== document.body && contextElement !== document.documentElement) {
+      for (const el of contextElement.querySelectorAll(inputSelector)) {
+        const normalized = normalizeCandidate(el);
+        if (normalized) candidates.add(normalized);
+      }
+    }
+    for (const el of document.querySelectorAll(inputSelector)) {
+      const normalized = normalizeCandidate(el);
+      if (normalized && pointRect && rectsIntersect(normalized.getBoundingClientRect(), pointRect)) {
+        candidates.add(normalized);
+      }
+    }
+
+    const centerX = pointRect ? pointRect.x + pointRect.width / 2 : 0;
+    const centerY = pointRect ? pointRect.y + pointRect.height / 2 : 0;
+    let best = null;
+    let bestIntersects = false;
+    let bestDist = Infinity;
+
+    for (const candidate of candidates) {
+      if (!isEligibleAnswerInput(candidate)) continue;
+      const rect = candidate.getBoundingClientRect();
+      const intersects = Boolean(pointRect && rectsIntersect(rect, pointRect));
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      const dist = Math.hypot(cx - centerX, cy - centerY);
+      if (!best || (intersects && !bestIntersects) || (intersects === bestIntersects && dist < bestDist)) {
+        best = candidate;
+        bestIntersects = intersects;
+        bestDist = dist;
+      }
+    }
+    return best;
+  }
+
+  function fillDetectedAnswerInput(el, rawAnswer) {
+    const value = String(rawAnswer ?? "").trim();
+    if (!value || !el?.isConnected) return false;
+
+    if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+      if (el instanceof HTMLInputElement && el.type === "number" && !/^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(value)) {
+        return false;
+      }
+      const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+      if (setter) setter.call(el, value);
+      else el.value = value;
+      el.setAttribute("data-answerly-filled", "true");
+      dispatchInput(el, value);
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    }
+
+    if (el.isContentEditable) {
+      el.textContent = value;
+      el.setAttribute("data-answerly-filled", "true");
+      dispatchInput(el, value);
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    }
+
+    return false;
   }
 
   function insertImagePendingNode(anchor, text, label, standalone) {
