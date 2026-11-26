@@ -75,11 +75,18 @@
     }
 
     const anchor = findQuestionBlock(focusElement);
-    const insertionPoint = editableSelection ? null : makeInsertionPoint(selection);
     const options = mode === "multiple-choice" ? findRadioOptions(anchor) : findNearbyContextOptions(anchor);
     if (mode === "multiple-choice" && options.length < 2) {
       showPageMessage("No multiple-choice options were found near this question.", anchor);
       return;
+    }
+
+    const preferInsideContainer = mode === "multiple-choice";
+    const insertionPoint = editableSelection || preferInsideContainer ? null : makeInsertionPoint(selection);
+    let placementAnchor = anchor;
+    if (preferInsideContainer && options.length >= 2) {
+      const lastOptionEl = options[options.length - 1]?.element;
+      placementAnchor = commonCardAncestor(anchor, lastOptionEl) || resolveCardContainer(anchor);
     }
 
     const operationId = ++operationNumber;
@@ -87,7 +94,7 @@
     activeOperation = operationId;
     activeRequestId = requestId;
     activeOptions = options;
-    const pending = insertPendingNode(anchor, "Thinking…", "", insertionPoint);
+    const pending = insertPendingNode(placementAnchor, "Thinking…", "", insertionPoint, preferInsideContainer);
     try {
       if (mode === "words" && editableSelection?.type === "page-editor") {
         activeEditorStatusToken = editableSelection.token;
@@ -507,26 +514,7 @@
       const node = document.createElement("div");
       node.setAttribute(OUTPUT_ATTR, "answer");
       node.setAttribute("role", "note");
-      const bgColor = document.body ? getComputedStyle(document.body).backgroundColor : "";
-      const isDark = isDarkBackgroundColor(bgColor);
-      node.style.position = "fixed";
-      node.style.left = "16px";
-      node.style.right = "16px";
-      node.style.bottom = "16px";
-      node.style.width = "auto";
-      node.style.maxWidth = "720px";
-      node.style.margin = "0 auto";
-      node.style.zIndex = "2147483646";
-      node.style.padding = "10px 14px";
-      node.style.borderRadius = "10px";
-      node.style.fontFamily = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
-      node.style.fontSize = "14px";
-      node.style.lineHeight = "1.45";
-      node.style.whiteSpace = "pre-wrap";
-      node.style.background = isDark ? "rgba(28, 28, 30, 0.92)" : "rgba(255, 255, 255, 0.94)";
-      node.style.color = isDark ? "#f5f5f7" : "#1d1d1f";
-      node.style.border = isDark ? "1px solid rgba(255,255,255,0.16)" : "1px solid rgba(0,0,0,0.12)";
-      node.style.boxShadow = "0 4px 20px rgba(0,0,0,0.22)";
+      applyStandaloneOverlayStyle(node);
       node.style.cursor = "pointer";
       node.textContent = `${label ? `${label}: ` : ""}${text}`;
       node.title = "Click to dismiss";
@@ -536,21 +524,36 @@
       return node;
     }
 
-    let safeAnchor = anchor;
-    if (safeAnchor?.parentElement) {
-      const parentStyle = getComputedStyle(safeAnchor.parentElement);
-      if (parentStyle.display.includes("flex") && parentStyle.flexDirection.startsWith("row")) {
-        safeAnchor = safeAnchor.parentElement;
-      }
-    }
-    return insertPendingNode(safeAnchor, text, label);
+    return insertPendingNode(resolveCardContainer(anchor), text, label, null, true);
+  }
+
+  function applyStandaloneOverlayStyle(node) {
+    const bgColor = document.body ? getComputedStyle(document.body).backgroundColor : "";
+    const isDark = isDarkBackgroundColor(bgColor);
+    node.style.position = "fixed";
+    node.style.left = "16px";
+    node.style.right = "16px";
+    node.style.bottom = "16px";
+    node.style.width = "auto";
+    node.style.maxWidth = "720px";
+    node.style.margin = "0 auto";
+    node.style.zIndex = "2147483646";
+    node.style.padding = "10px 14px";
+    node.style.borderRadius = "10px";
+    node.style.fontFamily = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
+    node.style.fontSize = "14px";
+    node.style.lineHeight = "1.45";
+    node.style.whiteSpace = "pre-wrap";
+    node.style.background = isDark ? "rgba(28, 28, 30, 0.92)" : "rgba(255, 255, 255, 0.94)";
+    node.style.color = isDark ? "#f5f5f7" : "#1d1d1f";
+    node.style.border = isDark ? "1px solid rgba(255,255,255,0.16)" : "1px solid rgba(0,0,0,0.12)";
+    node.style.boxShadow = "0 4px 20px rgba(0,0,0,0.22)";
   }
 
   function isDarkBackgroundColor(rgbString) {
-    const match = String(rgbString || "").match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
-    if (!match) return false;
-    const luminance = (0.299 * Number(match[1]) + 0.587 * Number(match[2]) + 0.114 * Number(match[3])) / 255;
-    return luminance < 0.5;
+    const parsed = parseRgba(rgbString);
+    if (!parsed || parsed.a <= 0.15) return false;
+    return relativeLuminance(parsed.r, parsed.g, parsed.b) < 0.5;
   }
 
   function nearbyQuestionContext(element) {
@@ -946,7 +949,138 @@
     }
   }
 
-  function insertPendingNode(anchor, text, label, insertionPoint = null) {
+  const CONTAINER_TAGS = new Set([
+    "DIV", "SECTION", "ARTICLE", "MAIN", "FORM", "FIELDSET",
+    "FIGURE", "LI", "TD", "TH", "DD", "BLOCKQUOTE", "ASIDE", "DETAILS"
+  ]);
+
+  function isContainerElement(el) {
+    return Boolean(el && el.nodeType === Node.ELEMENT_NODE && CONTAINER_TAGS.has(el.tagName));
+  }
+
+  function resolveCardContainer(anchor) {
+    if (!anchor?.isConnected) return document.body;
+    if (isContainerElement(anchor) && anchor !== document.body) return anchor;
+    let current = anchor.parentElement;
+    while (current && current !== document.documentElement) {
+      if (isContainerElement(current)) return current;
+      current = current.parentElement;
+    }
+    return document.body;
+  }
+
+  function commonCardAncestor(first, second) {
+    if (!first?.isConnected || !second?.isConnected) return null;
+    const ancestors = new Set();
+    for (let cur = first; cur && cur !== document.body && cur !== document.documentElement; cur = cur.parentElement) {
+      ancestors.add(cur);
+    }
+    for (let cur = second; cur && cur !== document.body && cur !== document.documentElement; cur = cur.parentElement) {
+      if (ancestors.has(cur) && isContainerElement(cur)) return cur;
+    }
+    return null;
+  }
+
+  function isHorizontalNowrapFlex(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+    const style = getComputedStyle(el);
+    return style.display.includes("flex") && style.flexDirection.startsWith("row") && style.flexWrap === "nowrap";
+  }
+
+  function placeNodeInsideContainer(container, node) {
+    node.style.boxSizing = "border-box";
+    node.style.display = "block";
+    node.style.width = "100%";
+    node.style.margin = "8px 0 0 0";
+    node.style.padding = "4px 0";
+
+    const target = container?.isConnected ? container : document.body;
+    const style = getComputedStyle(target);
+
+    if (style.display.includes("grid")) {
+      node.style.gridColumn = "1 / -1";
+      target.append(node);
+      return;
+    }
+
+    if (style.display.includes("flex") && style.flexDirection.startsWith("row")) {
+      if (style.flexWrap !== "nowrap") {
+        node.style.flex = "0 0 100%";
+        target.append(node);
+        return;
+      }
+      // Walk up out of horizontal nowrap flex rows so the answer isn't squeezed sideways.
+      let row = target;
+      let parent = target.parentElement;
+      while (parent && parent !== document.documentElement && isHorizontalNowrapFlex(parent)) {
+        row = parent;
+        parent = parent.parentElement;
+      }
+      if (parent && parent !== document.documentElement && row !== document.body) {
+        const parentStyle = getComputedStyle(parent);
+        if (parentStyle.display.includes("grid")) node.style.gridColumn = "1 / -1";
+        else if (parentStyle.display.includes("flex") && parentStyle.flexDirection.startsWith("row")) {
+          node.style.flex = "0 0 100%";
+        }
+        row.insertAdjacentElement("afterend", node);
+        return;
+      }
+      applyStandaloneOverlayStyle(node);
+      document.body.append(node);
+      return;
+    }
+
+    target.append(node);
+  }
+
+  function parseRgba(colorStr) {
+    const match = String(colorStr || "").match(/rgba?\(\s*([\d.]+)\s*[,\s]\s*([\d.]+)\s*[,\s]\s*([\d.]+)(?:\s*[,/]\s*([\d.]+))?\s*\)/i);
+    if (!match) return null;
+    return {
+      r: Number(match[1]),
+      g: Number(match[2]),
+      b: Number(match[3]),
+      a: match[4] === undefined ? 1 : Number(match[4])
+    };
+  }
+
+  function relativeLuminance(r, g, b) {
+    const linear = [r, g, b].map((channel) => {
+      const s = channel / 255;
+      return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+    });
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+  }
+
+  function contrastRatio(lumA, lumB) {
+    const lighter = Math.max(lumA, lumB);
+    const darker = Math.min(lumA, lumB);
+    return (lighter + 0.05) / (darker + 0.05);
+  }
+
+  function getEffectiveBackgroundColor(el) {
+    let cur = el;
+    while (cur && cur.nodeType === Node.ELEMENT_NODE) {
+      const parsed = parseRgba(getComputedStyle(cur).backgroundColor);
+      if (parsed && parsed.a > 0.15) return parsed;
+      cur = cur.parentElement;
+    }
+    return { r: 255, g: 255, b: 255, a: 1 };
+  }
+
+  function ensureReadableContrast(node) {
+    if (!answerUsePageColor || !node?.isConnected) return;
+    const fg = parseRgba(getComputedStyle(node).color);
+    const bg = getEffectiveBackgroundColor(node.parentElement || document.body);
+    if (!fg || !bg) return;
+    const fgLum = relativeLuminance(fg.r, fg.g, fg.b);
+    const bgLum = relativeLuminance(bg.r, bg.g, bg.b);
+    if (contrastRatio(fgLum, bgLum) < 4.5) {
+      node.style.color = bgLum < 0.4 ? "#f5f5f7" : "#1d1d1f";
+    }
+  }
+
+  function insertPendingNode(anchor, text, label, insertionPoint = null, preferInsideContainer = false) {
     const node = document.createElement("div");
     node.setAttribute(OUTPUT_ATTR, "answer");
     node.setAttribute("role", "note");
@@ -955,6 +1089,7 @@
     node.style.whiteSpace = "pre-wrap";
     node.style.display = "block";
     node.style.width = "100%";
+    node.style.margin = "6px 0 0 0";
     node.style.cursor = "pointer";
     node.style.opacity = "0.85";
     node.textContent = `${label ? `${label}: ` : ""}${text}`;
@@ -963,20 +1098,20 @@
     node.addEventListener("click", node._answerlyPendingDismiss, { once: true });
 
     let insertedAtSelection = false;
-    if (insertionPoint?.startContainer?.isConnected) {
+    if (!preferInsideContainer && insertionPoint?.startContainer?.isConnected) {
       try {
         const point = insertionPoint.cloneRange();
         point.collapse(true);
         point.insertNode(node);
         insertedAtSelection = true;
       } catch {
-        // Fall back to the question block if the page changed the range.
+        // Fall back to the question container if the page changed the range.
       }
     }
     if (!insertedAtSelection) {
-      if (anchor?.isConnected && anchor.parentElement) anchor.insertAdjacentElement("afterend", node);
-      else document.body.append(node);
+      placeNodeInsideContainer(resolveCardContainer(anchor), node);
     }
+    ensureReadableContrast(node);
     return node;
   }
 
@@ -1128,11 +1263,16 @@
   }
 
   function formatAnswer(result) {
-    const explanation = result.explanation ? ` ${result.explanation}` : "";
+    const answer = String(result.answer || "").trim();
+    const explanationText = String(result.explanation || "").trim();
+    const separator = explanationText
+      ? (/[.!?:]$/.test(answer) || answer.includes("\n") ? " " : " — ")
+      : "";
+    const explanation = explanationText ? `${separator}${explanationText}` : "";
     const citations = Array.isArray(result.citations) && result.citations.length
       ? ` Sources: ${result.citations.map((source) => `${source.file} · ${source.location}`).join("; ")}.`
       : "";
-    return `${result.answer}${explanation}${citations}`;
+    return `${answer}${explanation}${citations}`;
   }
 
   function copyTextStyle(source, target, fontScale = 1) {
@@ -1144,8 +1284,6 @@
     target.style.lineHeight = style.lineHeight;
     target.style.fontWeight = style.fontWeight;
     target.style.fontStyle = style.fontStyle;
-    target.style.margin = style.margin;
-    target.style.padding = style.padding;
   }
 
   function applyAnswerColor(node) {
